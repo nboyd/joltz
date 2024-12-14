@@ -4,6 +4,15 @@ Simple translation of Boltz-1 to JAX.
 
 We use single-dispatch to convert PyTorch modules to Equinox modules recursively.
 
+
+At a high-level we use the single-dispatch function `from_torch` to transform PyTorch modules to Equinox modules -- we use almost exactly the same names for the Equinox modules and their properties.
+
+I use the convention that each equinox module has a static (or class) `from_torch` method that takes as its sole argument the corresponding PyTorch module and returns an instance of the equinox class.
+Usually, this method calls `from_torch` on all of the pytorch module's children, and then constructs the equinox module using the results.
+Because the implementation of this function is almost always the same I use `AbstractFromTorch` to define a default implementation of `from_torch`.
+The final step is to register that function with the `from_torch` dispatcher. This is done with the `register_from_torch` class decorator, which takes a PyTorch module type and returns a decorator that registers the `from_torch` method of the equinox module.
+
+
 """
 # TODO: Finish confidence module
 # TODO: This is basically a line-by-line translation: could make it more "equinox-y"
@@ -12,9 +21,8 @@ We use single-dispatch to convert PyTorch modules to Equinox modules recursively
 # TODO: Model cache (?)
 # TODO: Dropout
 
-
 import time
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from functools import partial, singledispatch
 
 import boltz
@@ -38,63 +46,16 @@ from boltz.data import const
 
 # from boltz.model.modules import utils
 from jax import numpy as jnp
-from jax import tree_util as jtu
-from jax import vmap
+from jax import tree, vmap
 from jaxtyping import Array, Bool, Float
-
-
-# Small utility class for easy tree manipulation
-@dataclass(frozen=True, slots=True)
-class _At:
-    path: list[object]
-    pytree: object
-    cur_val: object  # we track this only so we can distinguish between DictKeys and SequenceKeys, seems a bit silly
-
-    def _accessor(self, node):
-        for key in self.path:
-            match key:
-                case jtu.DictKey(key):
-                    node = node[key]
-                case jtu.GetAttrKey(key):
-                    node = getattr(node, key)
-                case jtu.SequenceKey(key):
-                    node = node[key]
-
-        return node
-
-    def __getattr__(self, key) -> "_At":
-        return _At(
-            self.path + [jtu.GetAttrKey(key)], self.pytree, getattr(self.cur_val, key)
-        )
-
-    def __getitem__(self, key) -> "_At":
-        if isinstance(self.cur_val, dict):
-            return _At(self.path + [jtu.DictKey(key)], self.pytree, self.cur_val[key])
-        else:
-            return _At(
-                self.path + [jtu.SequenceKey(key)], self.pytree, self.cur_val[key]
-            )
-
-    def __call__(self, new_value):
-        return eqx.tree_at(self._accessor, self.pytree, new_value)
-
-    def replace(self, replace_fn: callable):
-        return eqx.tree_at(self._accessor, self.pytree, replace_fn=replace_fn)
-
-
-def At(pytree: object) -> _At:
-    """
-    Create a functional 'mutator' for a pytree. Two ways to use:
-        1. At(pytree).path.to.key(new_value) -> new pytree
-        2. At(pytree).path.to.key.replace(replace_fn) -> new pytree
-    """
-    return _At([], pytree, pytree)
 
 
 @singledispatch
 def from_torch(x):
     raise NotImplementedError(f"from_torch not implemented for {type(x)}: {x}")
 
+
+# basic types
 from_torch.register(torch.Tensor, lambda x: jnp.array(x.detach()))
 from_torch.register(int, lambda x: x)
 from_torch.register(float, lambda x: x)
@@ -108,8 +69,6 @@ from_torch.register(torch.nn.SiLU, lambda _: jax.nn.silu)
 from_torch.register(torch.nn.ModuleList, lambda x: [from_torch(m) for m in x])
 
 
-
-
 @from_torch.register(boltz.model.modules.utils.SwiGLU)
 def _handle(_):
     def _swiglu(x):
@@ -120,6 +79,13 @@ def _handle(_):
 
 
 class AbstractFromTorch(eqx.Module):
+    """
+    Default implementation of `from_torch` for equinox modules.
+    This checks that the fields of the equinox module are present in the torch module and constructs the equinox module from the torch module by recursively calling `from_torch` on the children of the torch module.
+    Allows for missing fields in the torch module if the corresponding field in the equinox module is optional.
+
+    """
+
     @classmethod
     def from_torch(cls, model: torch.nn.Module):
         # assemble arguments to `cls` constructor from `model`
@@ -207,10 +173,8 @@ class LayerNorm(eqx.Module):
             use_weight=self.weight is not None,
             use_bias=self.bias is not None,
         )
-        if self.weight is not None:
-            ln = At(ln).weight(self.weight)
-        if self.bias is not None:
-            ln = At(ln).bias(self.bias)
+        ln = eqx.tree_at(lambda l: (l.weight, l.bias), ln, (self.weight, self.bias), is_leaf=lambda x: x is None)
+
         return vmap_to_last_dimension(ln)(x)
 
     @staticmethod
@@ -218,9 +182,6 @@ class LayerNorm(eqx.Module):
         return LayerNorm(
             weight=from_torch(l.weight), bias=from_torch(l.bias), eps=l.eps
         )
-
-
-
 
 
 @register_from_torch(boltz.model.layers.transition.Transition)
@@ -237,8 +198,6 @@ class Transition(AbstractFromTorch):
             return self.fc3(jax.nn.silu(self.fc1(v)) * self.fc2(v))
 
         return vmap_to_last_dimension(apply)(x)
-
-
 
 
 @register_from_torch(boltz.model.layers.pair_averaging.PairWeightedAveraging)
@@ -283,7 +242,6 @@ class PairWeightedAveraging(AbstractFromTorch):
         o = jnp.transpose(o, (0, 2, 3, 1, 4))
         o = o.reshape(*o.shape[:3], self.num_heads * self.c_h)
         return self.proj_o(g * o)
-
 
 
 @register_from_torch(boltz.model.layers.triangular_mult.TriangleMultiplicationOutgoing)
@@ -336,8 +294,6 @@ class TriangleMultiplicationIncoming(AbstractFromTorch):
         x = jnp.einsum("bkid,bkjd->bijd", a, b)
 
         return self.p_out(self.norm_out(x)) * jax.nn.sigmoid(self.g_out(x_in))
-
-
 
 
 @register_from_torch(boltz.model.layers.triangular_attention.primitives.Attention)
@@ -406,12 +362,11 @@ class Attention(AbstractFromTorch):
 
 # Boltz-1 has a triangle layer specific layernorm
 
+
 @from_torch.register(boltz.model.layers.triangular_attention.primitives.LayerNorm)
 def _trilayer_norm(m: boltz.model.layers.triangular_attention.primitives.LayerNorm):
     assert len(m.c_in) == 1
     return LayerNorm(weight=from_torch(m.weight), bias=from_torch(m.bias), eps=m.eps)
-
-
 
 
 @register_from_torch(
@@ -448,8 +403,6 @@ class TriangleAttention(AbstractFromTorch):
         return x
 
 
-
-
 @register_from_torch(boltz.model.layers.outer_product_mean.OuterProductMean)
 class OuterProductMean(AbstractFromTorch):
     c_hidden: int
@@ -473,8 +426,6 @@ class OuterProductMean(AbstractFromTorch):
         z = einops.rearrange(z, "b i j c d -> b i j (c d)")
         z = z / num_mask
         return self.proj_o(z)
-
-
 
 
 @register_from_torch(boltz.model.modules.trunk.MSALayer)
@@ -537,7 +488,7 @@ class MSAModule(eqx.Module):
         assert not module.use_paired_feature
 
         msa_layers = [MSALayer.from_torch(layer) for layer in module.layers]
-        stacked_params = jax.tree.map(
+        stacked_params = tree.map(
             lambda *v: jnp.stack(v, 0),
             *[eqx.filter(layer, eqx.is_inexact_array) for layer in msa_layers],
         )
@@ -674,7 +625,7 @@ class Pairformer(eqx.Module):
         layers = [from_torch(layer) for layer in m.layers]
         _, static = eqx.partition(layers[0], eqx.is_inexact_array)
         return Pairformer(
-            jax.tree.map(
+            tree.map(
                 lambda *v: jnp.stack(v, 0),
                 *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
             ),
@@ -694,7 +645,6 @@ class Distogram(AbstractFromTorch):
 
     def __call__(self, z: Float[Array, "B N N D"]) -> Float[Array, "B N N P"]:
         return self.distogram(z + z.transpose(0, 2, 1, 3))
-
 
 
 @register_from_torch(boltz.model.modules.transformers.AdaLN)
@@ -765,7 +715,7 @@ class DiffusionTransformer(eqx.Module):
         layers = [from_torch(layer) for layer in m.layers]
         _, static = eqx.partition(layers[0], eqx.is_inexact_array)
         return DiffusionTransformer(
-            jax.tree.map(
+            tree.map(
                 lambda *v: jnp.stack(v, 0),
                 *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
             ),
@@ -842,7 +792,6 @@ class AtomAttentionEncoder(AbstractFromTorch):
     atom_encoder: AtomTransformer
     atom_to_token_trans: Sequential
 
-    # TODO: handle structure_prediction = True case
     s_to_c_trans: Sequential | None
     r_to_q_trans: Sequential | None
     z_to_p_trans: Sequential | None
@@ -937,7 +886,6 @@ class AtomAttentionEncoder(AbstractFromTorch):
             r_to_q = self.r_to_q_trans(r_input)
             q = q + r_to_q
 
-
         p = p + self.c_to_p_trans_q(c.reshape(B, K, W, 1, c.shape[-1]))
         p = p + self.c_to_p_trans_k(to_keys(c).reshape(B, K, 1, H, c.shape[-1]))
         p = p + self.p_mlp(p)
@@ -952,9 +900,9 @@ class AtomAttentionEncoder(AbstractFromTorch):
             atom_to_token.sum(axis=1, keepdims=True) + 1e-6
         )
 
-        a = vmap(lambda M, v: M.T @ v)(atom_to_token_mean, q_to_a) 
+        a = vmap(lambda M, v: M.T @ v)(atom_to_token_mean, q_to_a)
 
-        return a, q, c, p, to_keys  
+        return a, q, c, p, to_keys
 
 
 @register_from_torch(boltz.model.modules.trunk.InputEmbedder)
@@ -1053,7 +1001,6 @@ class FourierEmbedding(AbstractFromTorch):
         times = einops.rearrange(times, "b -> b 1")
         rand_proj = self.proj(times)
         return jnp.cos(2 * jnp.pi * rand_proj)
-
 
 
 @register_from_torch(boltz.model.modules.diffusion.OutTokenFeatUpdate)
@@ -1186,7 +1133,7 @@ class DiffusionModule(AbstractFromTorch):
         # Full self-attention on token level
         a = a + self.s_to_a_linear(s)
 
-        mask = feats["token_pad_mask"]  
+        mask = feats["token_pad_mask"]
         a = self.token_transformer(
             a,
             mask=mask,
@@ -1459,7 +1406,6 @@ class AtomDiffusion(AbstractFromTorch):
         key,
         **network_condition_kwargs,
     ):
-
         assert multiplicity == 1
         B, N, _ = network_condition_kwargs["s_trunk"].shape
 
@@ -1473,7 +1419,7 @@ class AtomDiffusion(AbstractFromTorch):
         init_sigma = sigmas[0]
         atom_coords = init_sigma * jax.random.normal(key=key, shape=shape)
         atom_coords_denoised = jnp.zeros_like(atom_coords)
-        model_cache = None  
+        model_cache = None
 
         token_repr = jnp.zeros((B, N, 768))
         token_a = jnp.zeros((B, N, 768))
@@ -1559,17 +1505,14 @@ class AtomDiffusion(AbstractFromTorch):
 
 
 def compute_aggregated_metric(logits, end=1.0):
-    """ Compute expected value of binned metric from logits"""
+    """Compute expected value of binned metric from logits"""
     num_bins = logits.shape[-1]
     bin_width = end / num_bins
-    bounds = jnp.arange(
-        start=0.5 * bin_width, end=end, step=bin_width
-    )
+    bounds = jnp.arange(start=0.5 * bin_width, end=end, step=bin_width)
     probs = jax.nn.softmax(logits, dim=-1)
     plddt = einops.einsum(probs, bounds, "... b, b -> ...")
 
     return plddt
-
 
 
 @register_from_torch(boltz.model.modules.confidence.ConfidenceHeads)
@@ -1580,8 +1523,7 @@ class ConfidenceHeads(AbstractFromTorch):
     to_resolved_logits: Linear
     to_pae_logits: Linear
 
-    def __call__(self, 
-                 s, z, x_pred, d, feats, pred_distogram_logits, multiplicity=1):
+    def __call__(self, s, z, x_pred, d, feats, pred_distogram_logits, multiplicity=1):
         assert multiplicity == 1
         plddt_logits = self.to_plddt_logits(s)
         assert len(z.shape) == 4
@@ -1594,7 +1536,7 @@ class ConfidenceHeads(AbstractFromTorch):
 
         # Retrieve relevant features
         token_type = feats["mol_type"]
-        is_ligand_token = (token_type == const.chain_type_ids["NONPOLYMER"])
+        is_ligand_token = token_type == const.chain_type_ids["NONPOLYMER"]
         # Compute the aggregated pLDDT and iPLDDT
         plddt = compute_aggregated_metric(plddt_logits)
         token_pad_mask = feats["token_pad_mask"]
@@ -1602,12 +1544,14 @@ class ConfidenceHeads(AbstractFromTorch):
             axis=-1
         )
         is_contact = (d < 8).float()
-        is_different_chain = (
-            jnp.expand_dims(feats["asym_id"], -1) != jnp.expand_dims(feats["asym_id"],-2)
+        is_different_chain = jnp.expand_dims(feats["asym_id"], -1) != jnp.expand_dims(
+            feats["asym_id"], -2
         )
 
         token_interface_mask = jnp.max(
-            is_contact * is_different_chain * jnp.expand_dims((1 - is_ligand_token), -1),
+            is_contact
+            * is_different_chain
+            * jnp.expand_dims((1 - is_ligand_token), -1),
             axis=-1,
         )
         iplddt_weight = (
@@ -1617,21 +1561,14 @@ class ConfidenceHeads(AbstractFromTorch):
             jnp.sum(token_pad_mask * iplddt_weight, axis=-1) + 1e-5
         )
         pde = compute_aggregated_metric(pde_logits, end=32)
-        pred_distogram_prob = jax.nn.softmax(
-            pred_distogram_logits, axis=-1
-        )
+        pred_distogram_prob = jax.nn.softmax(pred_distogram_logits, axis=-1)
         contacts = jnp.zeros((1, 1, 1, 64))
         contacts = contacts.at[:, :, :, :20].set(1.0)
         prob_contact = (pred_distogram_prob * contacts).sum(-1)
         token_pad_pair_mask = (
-            jnp.expand_dims(token_pad_mask,-1)
-            * jnp.expand_dims(token_pad_mask,-2)
-            * (
-                1
-                - jnp.eye(
-                    token_pad_mask.shape[1]
-                )[None, ...]
-            )
+            jnp.expand_dims(token_pad_mask, -1)
+            * jnp.expand_dims(token_pad_mask, -2)
+            * (1 - jnp.eye(token_pad_mask.shape[1])[None, ...])
         )
         token_pair_mask = token_pad_pair_mask * prob_contact
         complex_pde = (pde * token_pair_mask).sum(axis=(1, 2)) / token_pair_mask.sum(
@@ -1668,25 +1605,25 @@ class ConfidenceHeads(AbstractFromTorch):
         return out_dict
 
 
-        
-
 @register_from_torch(torch.nn.modules.sparse.Embedding)
 class SparseEmbedding(eqx.Module):
     embedding: eqx.nn.Embedding
 
     def __call__(self, indices):
         ndims = len(indices.shape)
+
         def apply(index):
             return self.embedding(index)
+
         f = apply
-        for _ in range(ndims ):
+        for _ in range(ndims):
             f = vmap(f)
-        
+
         return f(indices)
-    
+
     @staticmethod
     def from_torch(m: torch.nn.modules.sparse.Embedding):
-        return SparseEmbedding(embedding=eqx.nn.Embedding(weight = from_torch(m.weight)))
+        return SparseEmbedding(embedding=eqx.nn.Embedding(weight=from_torch(m.weight)))
 
 
 @register_from_torch(boltz.model.modules.confidence.ConfidenceModule)
@@ -1710,7 +1647,6 @@ class ConfidenceModule(eqx.Module):
     final_s_norm: LayerNorm
     final_z_norm: LayerNorm
 
-
     @staticmethod
     def from_torch(m: boltz.model.modules.confidence.ConfidenceModule):
         assert not m.no_update_s, "no_update_s not supported"
@@ -1721,15 +1657,24 @@ class ConfidenceModule(eqx.Module):
         return ConfidenceModule(
             **{k.name: from_torch(getattr(m, k.name)) for k in fields(ConfidenceModule)}
         )
-    
-    def __call__(self, s_inputs, s, z, x_pred, feats, pred_distogram_logits, multiplicity, s_diffusion):
+
+    def __call__(
+        self,
+        s_inputs,
+        s,
+        z,
+        x_pred,
+        feats,
+        pred_distogram_logits,
+        multiplicity,
+        s_diffusion,
+    ):
         assert multiplicity == 1
         s_inputs = self.input_embedder(feats)
         # Initialize the sequence and pairwise embeddings
         s_init = self.s_init(s_inputs)
         z_init = (
-            self.z_init_1(s_inputs)[:, :, None]
-            + self.z_init_2(s_inputs)[:, None, :]
+            self.z_init_1(s_inputs)[:, :, None] + self.z_init_2(s_inputs)[:, None, :]
         )
         relative_position_encoding = self.rel_pos(feats)
         z_init = z_init + relative_position_encoding
@@ -1737,7 +1682,7 @@ class ConfidenceModule(eqx.Module):
         # Apply recycling
         s = s_init + self.s_recycle(self.s_norm(s))
         z = z_init + self.z_recycle(self.z_norm(z))
-        
+
         s_diffusion = self.s_diffusion_norm(s_diffusion)
         s = s + self.s_diffusion_to_s(s_diffusion)
         z = (
@@ -1758,7 +1703,7 @@ class ConfidenceModule(eqx.Module):
         x_pred_repr = vmap(lambda M, v: M @ v)(token_to_rep_atom, x_pred)
         d = jax.scipy.spatial.distance.cdist(x_pred_repr, x_pred_repr)
 
-        distogram = (d[...,None] > self.boundaries).sum(axis=-1)
+        distogram = (d[..., None] > self.boundaries).sum(axis=-1)
         distogram = self.dist_bin_pairwise_embed(distogram)
         z = z + distogram
         mask = feats["token_pad_mask"]
@@ -1768,18 +1713,16 @@ class ConfidenceModule(eqx.Module):
         s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
 
         s, z = self.final_s_norm(s), self.final_z_norm(z)
-       
+
         return self.confidence_heads(
             s=s,
             z=z,
             x_pred=x_pred,
             d=d,
             feats=feats,
-            multiplicity = 1,
+            multiplicity=1,
             pred_distogram_logits=pred_distogram_logits,
         )
-
-
 
 
 @register_from_torch(boltz.model.model.Boltz1)
@@ -1879,9 +1822,6 @@ class Joltz1(eqx.Module):
         )
 
 
-
-
-
 class TestModule(torch.nn.Module):
     def __init__(self, module):
         super().__init__()
@@ -1896,10 +1836,10 @@ class TestModule(torch.nn.Module):
         jax_start = time.time()
         with jax.default_matmul_precision("float32"):
             jax_output = self.j_m(*from_torch(args), **from_torch(kwargs))
-        jax.tree.map(lambda v: v.block_until_ready(), jax_output)
+        tree.map(lambda v: v.block_until_ready(), jax_output)
         jax_end = time.time()
 
-        errors = jax.tree.map(
+        errors = tree.map(
             lambda a, b: jnp.abs(jnp.array(a) - b).max()
             if isinstance(b, jnp.ndarray)
             else None,

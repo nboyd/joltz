@@ -4,13 +4,15 @@ Simple translation of Boltz-1 to JAX.
 
 We use single-dispatch to convert PyTorch modules to Equinox modules recursively.
 
-
 At a high-level we use the single-dispatch function `from_torch` to transform PyTorch modules to Equinox modules -- we use almost exactly the same names for the Equinox modules and their properties.
 
 I use the convention that each equinox module has a static (or class) `from_torch` method that takes as its sole argument the corresponding PyTorch module and returns an instance of the equinox class.
 Usually, this method calls `from_torch` on all of the pytorch module's children, and then constructs the equinox module using the results.
 Because the implementation of this function is almost always the same I use `AbstractFromTorch` to define a default implementation of `from_torch`.
 The final step is to register that function with the `from_torch` dispatcher. This is done with the `register_from_torch` class decorator, which takes a PyTorch module type and returns a decorator that registers the `from_torch` method of the equinox module.
+
+`backend.py` contains the basic machinery for this and some translations of vanilla PyTorch modules.
+This file contains translations of Boltz-1 modules.
 
 
 """
@@ -21,9 +23,8 @@ The final step is to register that function with the `from_torch` dispatcher. Th
 # TODO: Model cache (?)
 # TODO: Dropout
 
-import time
 from dataclasses import fields
-from functools import partial, singledispatch
+from functools import partial
 
 import boltz
 import boltz.model.layers.outer_product_mean
@@ -41,7 +42,6 @@ import einops
 import equinox as eqx
 import jax
 import numpy as np
-import torch
 from boltz.data import const
 
 # from boltz.model.modules import utils
@@ -49,24 +49,16 @@ from jax import numpy as jnp
 from jax import tree, vmap
 from jaxtyping import Array, Bool, Float
 
-
-@singledispatch
-def from_torch(x):
-    raise NotImplementedError(f"from_torch not implemented for {type(x)}: {x}")
-
-
-# basic types
-from_torch.register(torch.Tensor, lambda x: jnp.array(x.detach()))
-from_torch.register(int, lambda x: x)
-from_torch.register(float, lambda x: x)
-from_torch.register(bool, lambda x: x)
-from_torch.register(type(None), lambda x: x)
-from_torch.register(tuple, lambda x: tuple(map(from_torch, x)))
-from_torch.register(dict, lambda x: {k: from_torch(v) for k, v in x.items()})
-from_torch.register(torch.nn.ReLU, lambda _: jax.nn.relu)
-from_torch.register(torch.nn.Sigmoid, lambda _: jax.nn.sigmoid)
-from_torch.register(torch.nn.SiLU, lambda _: jax.nn.silu)
-from_torch.register(torch.nn.ModuleList, lambda x: [from_torch(m) for m in x])
+from backend import (
+    AbstractFromTorch,
+    LayerNorm,
+    Linear,
+    from_torch,
+    register_from_torch,
+    vmap_to_last_dimension,
+    Sequential,
+    SparseEmbedding
+)
 
 
 @from_torch.register(boltz.model.modules.utils.SwiGLU)
@@ -78,136 +70,28 @@ def _handle(_):
     return _swiglu
 
 
-class AbstractFromTorch(eqx.Module):
-    """
-    Default implementation of `from_torch` for equinox modules.
-    This checks that the fields of the equinox module are present in the torch module and constructs the equinox module from the torch module by recursively calling `from_torch` on the children of the torch module.
-    Allows for missing fields in the torch module if the corresponding field in the equinox module is optional.
-
-    """
-
-    @classmethod
-    def from_torch(cls, model: torch.nn.Module):
-        # assemble arguments to `cls` constructor from `model`
-
-        field_to_type = {field.name: field.type for field in fields(cls)}
-        kwargs = {
-            child: from_torch(child_module)
-            for child, child_module in model.named_children()
-        } | {
-            parameter_name: from_torch(parameter)
-            for parameter_name, parameter in model.named_parameters(recurse=False)
-        }
-
-        # add fields that are not child_modules or parameters
-        for field_name, field_type in field_to_type.items():
-            if not hasattr(model, field_name):
-                if not isinstance(None, field_type):
-                    raise ValueError(
-                        f"Field {field_name} for {cls} is not optional but is missing from torch model {model}"
-                    )
-                else:
-                    kwargs[field_name] = None
-            else:
-                kwargs[field_name] = from_torch(getattr(model, field_name))
-
-        # check we're not passing any additional properties
-        torch_not_equinox = kwargs.keys() - field_to_type.keys()
-        if torch_not_equinox:
-            raise ValueError(
-                f"Properties in torch model not found in equinox module {cls}: {torch_not_equinox}"
-            )
-
-        return cls(**kwargs)
-
-
-def register_from_torch(torch_module_type):
-    def decorator(cls):
-        from_torch.register(torch_module_type, cls.from_torch)
-        return cls
-
-    return decorator
-
-
-# this isn't very jax-y
-def _vmap(f, tensor, *args):
-    for _ in range(len(tensor.shape) - 1):
-        f = vmap(f)
-    return f(tensor, *args)
-
-
-def vmap_to_last_dimension(f):
-    return partial(_vmap, f)
-
-
-@register_from_torch(torch.nn.Linear)
-class Linear(eqx.Module):
-    """Linear layer that matches pytorch semantics"""
-
-    weight: Float[Array, "Out In"]
-    bias: Float[Array, "Out"] | None
-
-    def __call__(self, x: Float[Array, "... In"]) -> Float[Array, "... Out"]:
-        o = einops.einsum(x, self.weight, "... In, Out In -> ... Out")
-        if self.bias is not None:
-            o = o + jnp.broadcast_to(self.bias, x.shape[:-1] + (self.bias.shape[-1],))
-        return o
-
-    @staticmethod
-    def from_torch(l: torch.nn.Linear):
-        return Linear(weight=from_torch(l.weight), bias=from_torch(l.bias))
-
-
-@register_from_torch(torch.nn.LayerNorm)
-class LayerNorm(eqx.Module):
-    """LayerNorm that matches pytorch semantics"""
-
-    weight: Float[Array, "Out"] | None
-    bias: Float[Array, "Out"] | None
-    eps: float
-
-    def __call__(self, x: Float[Array, "... Out"]) -> Float[Array, "... Out"]:
-        ln = eqx.nn.LayerNorm(
-            shape=x.shape[-1],
-            eps=self.eps,
-            use_weight=self.weight is not None,
-            use_bias=self.bias is not None,
-        )
-        ln = eqx.tree_at(lambda l: (l.weight, l.bias), ln, (self.weight, self.bias), is_leaf=lambda x: x is None)
-
-        return vmap_to_last_dimension(ln)(x)
-
-    @staticmethod
-    def from_torch(l: torch.nn.LayerNorm):
-        return LayerNorm(
-            weight=from_torch(l.weight), bias=from_torch(l.bias), eps=l.eps
-        )
-
-
 @register_from_torch(boltz.model.layers.transition.Transition)
 class Transition(AbstractFromTorch):
-    norm: eqx.nn.LayerNorm
-    fc1: eqx.nn.Linear
-    fc2: eqx.nn.Linear
-    fc3: eqx.nn.Linear
+    norm: LayerNorm
+    fc1: Linear
+    fc2: Linear
+    fc3: Linear
     silu: callable
 
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... P"]:
-        def apply(v: Float[Array, "D"]):
-            v = self.norm(v)
-            return self.fc3(jax.nn.silu(self.fc1(v)) * self.fc2(v))
+        v = self.norm(x)
+        return self.fc3(jax.nn.silu(self.fc1(v)) * self.fc2(v))
 
-        return vmap_to_last_dimension(apply)(x)
 
 
 @register_from_torch(boltz.model.layers.pair_averaging.PairWeightedAveraging)
 class PairWeightedAveraging(AbstractFromTorch):
-    norm_m: eqx.nn.LayerNorm
-    norm_z: eqx.nn.LayerNorm
-    proj_m: eqx.nn.Linear
-    proj_g: eqx.nn.Linear
-    proj_z: eqx.nn.Linear
-    proj_o: eqx.nn.Linear
+    norm_m: LayerNorm
+    norm_z: LayerNorm
+    proj_m: Linear
+    proj_g: Linear
+    proj_z: Linear
+    proj_o: Linear
     num_heads: int
     c_h: int  # channel heads
     inf: float
@@ -500,22 +384,6 @@ class MSAModule(eqx.Module):
             stacked_params=stacked_params,
             static=static,
         )
-
-
-@register_from_torch(torch.nn.Sequential)
-class Sequential(eqx.Module):
-    _modules: dict[
-        str, AbstractFromTorch
-    ]  # IMHO this is a fairly wild design choice, but this is really how pytorch works.
-
-    def __call__(self, x):
-        for idx in range(len(self._modules)):
-            x = self._modules[str(idx)](x)
-        return x
-
-    @staticmethod
-    def from_torch(module: torch.nn.Sequential):
-        return Sequential(_modules=from_torch(module._modules))
 
 
 def _rearrange(pattern):
@@ -1605,31 +1473,10 @@ class ConfidenceHeads(AbstractFromTorch):
         return out_dict
 
 
-@register_from_torch(torch.nn.modules.sparse.Embedding)
-class SparseEmbedding(eqx.Module):
-    embedding: eqx.nn.Embedding
-
-    def __call__(self, indices):
-        ndims = len(indices.shape)
-
-        def apply(index):
-            return self.embedding(index)
-
-        f = apply
-        for _ in range(ndims):
-            f = vmap(f)
-
-        return f(indices)
-
-    @staticmethod
-    def from_torch(m: torch.nn.modules.sparse.Embedding):
-        return SparseEmbedding(embedding=eqx.nn.Embedding(weight=from_torch(m.weight)))
-
-
 @register_from_torch(boltz.model.modules.confidence.ConfidenceModule)
 class ConfidenceModule(eqx.Module):
     boundaries: Float[Array, "B"]
-    dist_bin_pairwise_embed: eqx.nn.Embedding
+    dist_bin_pairwise_embed: SparseEmbedding
     confidence_heads: ConfidenceHeads
     # copies of most trunk modules
     s_init: Linear
@@ -1820,35 +1667,3 @@ class Joltz1(eqx.Module):
         return Joltz1(
             **{k.name: from_torch(getattr(m, k.name)) for k in fields(Joltz1)}
         )
-
-
-class TestModule(torch.nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.mod = module
-        self.j_m = eqx.filter_jit(from_torch(self.mod))
-
-    def forward(self, *args, **kwargs):
-        torch_start = time.time()
-        torch_output = self.mod(*args, **kwargs)
-        torch_end = time.time()
-
-        jax_start = time.time()
-        with jax.default_matmul_precision("float32"):
-            jax_output = self.j_m(*from_torch(args), **from_torch(kwargs))
-        tree.map(lambda v: v.block_until_ready(), jax_output)
-        jax_end = time.time()
-
-        errors = tree.map(
-            lambda a, b: jnp.abs(jnp.array(a) - b).max()
-            if isinstance(b, jnp.ndarray)
-            else None,
-            torch_output,
-            jax_output,
-            is_leaf=eqx.is_inexact_array,
-        )
-        print(f"max abs error {type(self.mod)}: ", errors)
-        print(
-            f"torch time: {torch_end - torch_start : .3f}s, jax time: {jax_end - jax_start : .3f}s"
-        )
-        return torch_output

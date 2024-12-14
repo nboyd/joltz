@@ -5,6 +5,8 @@ For an example of how to load and use the model see the [example script](example
 
 Work in progress, any feedback/PRs welcome!
 
+Tested with boltz 0.3.2; will almost certainly break with more recent versions.
+
 #### TODO:
 - [ ] Finish confidence module
 - [ ] Chunking

@@ -5,8 +5,10 @@ from pathlib import Path
 
 import equinox as eqx
 import jax
+
 import numpy as np
 import torch
+
 from boltz.main import (
     BoltzDiffusionParams,
     BoltzInferenceDataModule,
@@ -15,6 +17,7 @@ from boltz.main import (
     Manifest,
     check_inputs,
     process_inputs,
+    download,
 )
 from boltz.model.model import Boltz1
 
@@ -29,6 +32,12 @@ predict_args = {
     "write_full_pde": True,
 }
 
+
+# download boltz weights etc if not already installed
+# Set cache path
+cache = Path("~/.boltz").expanduser()
+cache.mkdir(parents=True, exist_ok=True)
+download(cache)
 
 # load model and convert to JAX
 

@@ -11,7 +11,7 @@ import torch
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 from functools import partial
-
+import numpy as np
 
 
 @singledispatch
@@ -20,7 +20,7 @@ def from_torch(x):
 
 
 # basic types
-from_torch.register(torch.Tensor, lambda x: jnp.array(x.detach()))
+from_torch.register(torch.Tensor, lambda x: np.array(x.detach()))
 from_torch.register(int, lambda x: x)
 from_torch.register(float, lambda x: x)
 from_torch.register(bool, lambda x: x)

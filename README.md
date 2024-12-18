@@ -8,9 +8,9 @@ Work in progress, any feedback/PRs welcome!
 Tested with boltz 0.3.2; will almost certainly break with more recent versions.
 
 #### TODO:
-- [ ] Finish confidence module
+- [~] Finish confidence module
 - [ ] Chunking
-- [ ] Model cache
+- [x] Model cache
 - [ ] Dropout
 - [ ] Fix structure module on CPU
 - [ ] Refactor to remove explicit batching

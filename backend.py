@@ -11,6 +11,7 @@ import torch
 from jax import numpy as jnp
 from jaxtyping import Array, Float
 from functools import partial
+import numpy as np
 
 
 
@@ -20,7 +21,7 @@ def from_torch(x):
 
 
 # basic types
-from_torch.register(torch.Tensor, lambda x: jnp.array(x.detach()))
+from_torch.register(torch.Tensor, lambda x: np.array(x.detach()))
 from_torch.register(int, lambda x: x)
 from_torch.register(float, lambda x: x)
 from_torch.register(bool, lambda x: x)
@@ -31,6 +32,8 @@ from_torch.register(torch.nn.ReLU, lambda _: jax.nn.relu)
 from_torch.register(torch.nn.Sigmoid, lambda _: jax.nn.sigmoid)
 from_torch.register(torch.nn.SiLU, lambda _: jax.nn.silu)
 from_torch.register(torch.nn.ModuleList, lambda x: [from_torch(m) for m in x])
+
+
 
 
 class AbstractFromTorch(eqx.Module):

@@ -44,7 +44,6 @@ import jax
 import numpy as np
 from boltz.data import const
 
-# from boltz.model.modules import utils
 from jax import numpy as jnp
 from jax import tree, vmap
 from jaxtyping import Array, Bool, Float
@@ -55,9 +54,8 @@ from backend import (
     Linear,
     from_torch,
     register_from_torch,
-    vmap_to_last_dimension,
     Sequential,
-    SparseEmbedding
+    SparseEmbedding,
 )
 
 
@@ -81,7 +79,6 @@ class Transition(AbstractFromTorch):
     def __call__(self, x: Float[Array, "... D"]) -> Float[Array, "... P"]:
         v = self.norm(x)
         return self.fc3(jax.nn.silu(self.fc1(v)) * self.fc2(v))
-
 
 
 @register_from_torch(boltz.model.layers.pair_averaging.PairWeightedAveraging)
@@ -276,7 +273,6 @@ class TriangleAttention(AbstractFromTorch):
         x = self.layer_norm(x)
 
         mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
-        # triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
         triangle_bias = einops.rearrange(self.linear(x), "... J I H -> ... 1 H J I")
         biases = [mask_bias, triangle_bias]
         x = self.mha(q_x=x, kv_x=x, biases=biases)
@@ -394,7 +390,6 @@ def _rearrange(pattern):
 from_torch.register(einops.layers.torch.Rearrange, lambda x: _rearrange(x.pattern))
 
 
-
 @register_from_torch(boltz.model.layers.attention.AttentionPairBias)
 class AttentionPairBias(AbstractFromTorch):
     c_s: int  # input sequence dim
@@ -413,21 +408,16 @@ class AttentionPairBias(AbstractFromTorch):
     def compute_pair_bias(self, z):
         return self.proj_z(z)
 
-
     # During diffusion sampling we can precompute pair bias from z
     def __call__(
         self,
         *,
         s: Float[Array, "B S D"],
-        #pair_bias: Float[Array, "B H N N"],
         z: Float[Array, "B N N P"],
         mask: Bool[Array, "B N"],
         to_keys=None,
-        bias = None
-        # pair_bias = jax.Array | None, 
+        bias=None,
     ):
-        
-        # assert pair_bias is None
         if bias is None:
             bias = self.compute_pair_bias(z)
 
@@ -446,14 +436,10 @@ class AttentionPairBias(AbstractFromTorch):
         k = self.proj_k(k_in).reshape(B, -1, self.num_heads, self.head_dim)
         v = self.proj_v(k_in).reshape(B, -1, self.num_heads, self.head_dim)
 
-        
-
         g = jax.nn.sigmoid(self.proj_g(s))
 
         attn = jnp.einsum("bihd,bjhd->bhij", q, k)
-        attn = (
-            attn / (self.head_dim**0.5) + bias
-        )  # einops.rearrange(z, "b i j h -> b h i j")
+        attn = attn / (self.head_dim**0.5) + bias
         attn = attn + (1 - mask[:, None, None]) * -self.inf
         attn = jax.nn.softmax(attn, axis=-1)
         o = jnp.einsum("bhij,bjhd->bihd", attn, v)
@@ -490,7 +476,9 @@ class PairformerLayer(AbstractFromTorch):
         z = z + self.tri_att_end(z, pair_mask)
         z = z + self.transition_z(z)
         assert not self.no_update_s
-        s = s + self.attention(s = s, z = z, mask = mask, bias = self.attention.compute_pair_bias(z))#pair_bias = self.attention.compute_pair_bias(z), mask=mask)
+        s = s + self.attention(
+            s=s, z=z, mask=mask, bias=self.attention.compute_pair_bias(z)
+        )
         s = s + self.transition_s(s)
 
         return s, z
@@ -564,28 +552,13 @@ class DiffusionTransformerLayer(AbstractFromTorch):
     output_projection: Sequential
     transition: ConditionedTransitionBlock
 
-    # def __call__(self,*, a, s, pair_bias, mask=None, to_keys=None):
-    #     b = self.adaln(a, s)
-
-    #     assert a.ndim == 3
-
-    #     # TODO: precompute pair bias
-    #     b = self.pair_bias_attn(
-    #         s=b, pair_bias=pair_bias, mask=mask, to_keys=to_keys
-    #     )
-    #     b = self.output_projection(s) * b
-    #     a = a + b
-    #     return a + self.transition(a, s)
-
-    def __call__(self,*, a, s, z, mask=None, to_keys=None, bias = None):
+    def __call__(self, *, a, s, z, mask=None, to_keys=None, bias=None):
         b = self.adaln(a, s)
 
         assert a.ndim == 3
 
         # TODO: precompute pair bias
-        b = self.pair_bias_attn(
-            s=b, z=z, mask=mask, to_keys=to_keys, bias = bias
-        )
+        b = self.pair_bias_attn(s=b, z=z, mask=mask, to_keys=to_keys, bias=bias)
         b = self.output_projection(s) * b
         a = a + b
         return a + self.transition(a, s)
@@ -596,32 +569,26 @@ class DiffusionTransformer(eqx.Module):
     stacked_parameters: DiffusionTransformerLayer
     static: DiffusionTransformerLayer
 
-
     def precompute_pair_biases(self, z):
-        # assert False
         def precompute_layer_bias(params: DiffusionTransformerLayer):
             r = eqx.combine(params, self.static).pair_bias_attn.compute_pair_bias(z)
             return r
+
         return vmap(precompute_layer_bias)(self.stacked_parameters)
 
     def __call__(
-        self, a, s, z, *, pair_biases=None, mask=None,  to_keys=None, multiplicity=None
+        self, a, s, z, *, pair_biases=None, mask=None, to_keys=None, multiplicity=None
     ):
         if pair_biases is None:
             pair_biases = self.precompute_pair_biases(z)
 
-
         def body_fn(a, params_and_bias):
             # reconstitute layer
             params, bias = params_and_bias
-            #params = params_and_bias
             layer = eqx.combine(self.static, params)
-            return layer(
-                a=a, s=s, z=z, mask=mask, to_keys=to_keys,  bias = bias
-            ), None
+            return layer(a=a, s=s, z=z, mask=mask, to_keys=to_keys, bias=bias), None
 
         return jax.lax.scan(body_fn, a, (self.stacked_parameters, pair_biases))[0]
-        # return jax.lax.scan(body_fn, a, self.stacked_parameters)[0]
 
     @staticmethod
     def from_torch(m: boltz.model.modules.transformers.DiffusionTransformer):
@@ -649,17 +616,13 @@ class AtomTransformer(AbstractFromTorch):
             B, N, D = q_shape
             NW = N // W
 
-            #p = p.reshape((p.shape[0] * NW, W, H, -1))
-            # Hope this doesn't change... 
+            # p = p.reshape((p.shape[0] * NW, W, H, -1))
+            # Hope this doesn't change...
             p = p.reshape((-1, 32, 128, 16))
 
         return self.diffusion_transformer.precompute_pair_biases(p)
 
-
-        
-    def __call__(
-        self, q, c, p, to_keys=None, mask=None, cache=None, multiplicity=None
-    ):
+    def __call__(self, q, c, p, to_keys=None, mask=None, cache=None, multiplicity=None):
         W = self.attn_window_queries
         H = self.attn_window_keys
         if W is not None:
@@ -704,6 +667,7 @@ def single_to_keys(single, indexing_matrix, W, H):
     )
     return r
 
+
 class AtomEncoderCache(eqx.Module):
     q: jax.Array
     c: jax.Array
@@ -721,7 +685,7 @@ class AtomAttentionEncoder(AbstractFromTorch):
     atoms_per_window_queries: int
     atoms_per_window_keys: int
 
-    structure_prediction: bool # We should split this out into two different modules...
+    structure_prediction: bool  # We should split this out into two different modules...
 
     c_to_p_trans_k: Sequential
     c_to_p_trans_q: Sequential
@@ -733,8 +697,7 @@ class AtomAttentionEncoder(AbstractFromTorch):
     r_to_q_trans: Sequential | None
     z_to_p_trans: Sequential | None
 
-
-    def compute_cache(self, feats, s_trunk, z = None):
+    def compute_cache(self, feats, s_trunk, z=None):
         if z is None and self.structure_prediction:
             raise ValueError("z must be provided if structure_prediction is True")
         B, N, _ = feats["ref_pos"].shape
@@ -818,7 +781,6 @@ class AtomAttentionEncoder(AbstractFromTorch):
         transformer_cache = self.atom_encoder.precompute_pair_biases(q.shape, p)
         return AtomEncoderCache(q, c, p, to_keys, transformer_cache)
 
-
     def __call__(
         self,
         feats: dict[str, any],
@@ -827,11 +789,10 @@ class AtomAttentionEncoder(AbstractFromTorch):
         r=None,
         cache: AtomEncoderCache | None = None,
         multiplicity=1,
-    ):  
-
+    ):
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"]
-        
+
         q, c, p, to_keys = cache.q, cache.c, cache.p, cache.to_keys
 
         if self.structure_prediction:
@@ -843,10 +804,13 @@ class AtomAttentionEncoder(AbstractFromTorch):
             r_to_q = self.r_to_q_trans(r_input)
             q = q + r_to_q
 
-        
-
         q = self.atom_encoder(
-            q=q, mask=atom_mask, c=c, p=p, to_keys=to_keys, cache=cache.transformer_cache
+            q=q,
+            mask=atom_mask,
+            c=c,
+            p=p,
+            to_keys=to_keys,
+            cache=cache.transformer_cache,
         )
 
         q_to_a = self.atom_to_token_trans(q)
@@ -1019,6 +983,7 @@ class PairwiseConditioning(AbstractFromTorch):
 class AtomDecoderCache(eqx.Module):
     transformer_cache: jax.Array
 
+
 @register_from_torch(boltz.model.modules.encoders.AtomAttentionDecoder)
 class AtomAttentionDecoder(AbstractFromTorch):
     a_to_q_trans: Linear
@@ -1028,7 +993,9 @@ class AtomAttentionDecoder(AbstractFromTorch):
     def compute_cache(self, q_shape, p):
         return AtomDecoderCache(self.atom_decoder.precompute_pair_biases(q_shape, p))
 
-    def __call__(self,*,  a, q, c, p, feats, to_keys, cache: AtomDecoderCache, multiplicity=1):
+    def __call__(
+        self, *, a, q, c, p, feats, to_keys, cache: AtomDecoderCache, multiplicity=1
+    ):
         assert multiplicity == 1
         atom_mask = feats["atom_pad_mask"]
 
@@ -1049,12 +1016,12 @@ class AtomAttentionDecoder(AbstractFromTorch):
         return r_update
 
 
-
 class DiffusionModelCache(eqx.Module):
     z: jax.Array
     token_transformer: jax.Array
     encoder_cache: AtomEncoderCache
     decoder_cache: AtomDecoderCache
+
 
 @register_from_torch(boltz.model.modules.diffusion.DiffusionModule)
 class DiffusionModule(AbstractFromTorch):
@@ -1069,27 +1036,25 @@ class DiffusionModule(AbstractFromTorch):
     a_norm: LayerNorm
     atom_attention_decoder: AtomAttentionDecoder
 
-
-    def compute_caches(self, feats, s_trunk, z_trunk, relative_position_encoding) -> DiffusionModelCache:
-
+    def compute_caches(
+        self, feats, s_trunk, z_trunk, relative_position_encoding
+    ) -> DiffusionModelCache:
         B, _, N = s_trunk.shape
 
         z = self.pairwise_conditioner(
             z_trunk=z_trunk, token_rel_pos_feats=relative_position_encoding
         )
         encoder_cache = self.atom_attention_encoder.compute_cache(
-                feats = feats, s_trunk = s_trunk, z = z
-            )
+            feats=feats, s_trunk=s_trunk, z=z
+        )
         return DiffusionModelCache(
             token_transformer=self.token_transformer.precompute_pair_biases(z),
             encoder_cache=encoder_cache,
-            z = z,
-            decoder_cache = self.atom_attention_decoder.compute_cache(
-                q_shape = (B, N, self.atoms_per_window_keys),
-                p = encoder_cache.p
-            )
+            z=z,
+            decoder_cache=self.atom_attention_decoder.compute_cache(
+                q_shape=(B, N, self.atoms_per_window_keys), p=encoder_cache.p
+            ),
         )
-
 
     def __call__(
         self,
@@ -1103,16 +1068,14 @@ class DiffusionModule(AbstractFromTorch):
         feats,
         cache: DiffusionModelCache,
         multiplicity=1,
-
     ):
-
         # s_inputs, s_trunk, and z_trunk are *constant* across calls to this module during diffusion sampling
         # anything expensive that just relies on these inputs should be precomputed
         assert multiplicity == 1
         s, normed_fourier = self.single_conditioner(
             times=times, s_trunk=s_trunk, s_inputs=s_inputs
         )
-        
+
         # Compute Atom Attention Encoder and aggregation to coarse-grained tokens
         a, q_skip, c_skip, p_skip, to_keys = self.atom_attention_encoder(
             feats=feats,
@@ -1120,7 +1083,7 @@ class DiffusionModule(AbstractFromTorch):
             z=cache.z,
             r=r_noisy,
             multiplicity=multiplicity,
-            cache = cache.encoder_cache,
+            cache=cache.encoder_cache,
         )
 
         # Full self-attention on token level
@@ -1131,10 +1094,9 @@ class DiffusionModule(AbstractFromTorch):
             a,
             mask=mask,
             s=s,
-            z=cache.z,  
+            z=cache.z,
             multiplicity=multiplicity,
             pair_biases=cache.token_transformer,
-
         )
         a = self.a_norm(a)
         # Broadcast token activations to atoms and run Sequence-local Atom Attention
@@ -1146,7 +1108,7 @@ class DiffusionModule(AbstractFromTorch):
             feats=feats,
             multiplicity=multiplicity,
             to_keys=to_keys,
-            cache  = cache.decoder_cache,
+            cache=cache.decoder_cache,
         )
         return {"r_update": r_update, "token_a": a}
 
@@ -1260,11 +1222,6 @@ def weighted_rigid_align(
     weights,
     mask,
 ):
-    # true_coords = jax.lax.stop_gradient(true_coords)
-    # pred_coords = jax.lax.stop_gradient(pred_coords)
-    # weights = jax.lax.stop_gradient(weights)
-    # mask = jax.lax.stop_gradient(mask)
-
     batch_size, num_points, dim = true_coords.shape
     weights = (mask * weights)[..., None]
 
@@ -1309,7 +1266,6 @@ def weighted_rigid_align(
         einops.einsum(true_coords_centered, rot_matrix, "b n i, b j i -> b n j")
         + pred_centroid
     )
-    #aligned_coords = jax.lax.stop_gradient(aligned_coords)
 
     return aligned_coords
 
@@ -1359,7 +1315,6 @@ class AtomDiffusion(AbstractFromTorch):
         relative_position_encoding,
         multiplicity: int = 1,
         model_cache: DiffusionModelCache,
-
     ):
         batch = noised_atom_coords.shape[0]
         sigma = jnp.full((batch,), sigma)
@@ -1369,11 +1324,11 @@ class AtomDiffusion(AbstractFromTorch):
         net_out = self.score_model(
             r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
             times=self.c_noise(sigma),
-            s_inputs = s_inputs,
-            s_trunk = s_trunk,
-            z_trunk = z_trunk,
-            relative_position_encoding = relative_position_encoding,
-            feats = feats,
+            s_inputs=s_inputs,
+            s_trunk=s_trunk,
+            z_trunk=z_trunk,
+            relative_position_encoding=relative_position_encoding,
+            feats=feats,
             multiplicity=multiplicity,
             cache=model_cache,
         )
@@ -1418,7 +1373,6 @@ class AtomDiffusion(AbstractFromTorch):
         s_inputs,
         feats,
         relative_position_encoding,
-
     ):
         assert multiplicity == 1
         B, N, _ = s_trunk.shape
@@ -1487,7 +1441,7 @@ class AtomDiffusion(AbstractFromTorch):
                 z_trunk=z_trunk,
                 s_inputs=s_inputs,
                 feats=feats,
-                relative_position_encoding=relative_position_encoding
+                relative_position_encoding=relative_position_encoding,
             )
 
             sigma = jnp.full(
@@ -1532,9 +1486,7 @@ def compute_aggregated_metric(logits, end=1.0):
     """Compute expected value of binned metric from logits"""
     num_bins = logits.shape[-1]
     bin_width = end / num_bins
-    #bounds = jnp.arange(start=0.5 * bin_width, end=end, step=bin_width)
     bounds = jnp.arange(start=0.5 * bin_width, stop=end, step=bin_width)
-    #probs = jax.nn.softmax(logits, dim=-1)
     probs = jax.nn.softmax(logits, axis=-1)
     plddt = einops.einsum(probs, bounds, "... b, b -> ...")
 
@@ -1569,7 +1521,7 @@ class ConfidenceHeads(AbstractFromTorch):
         complex_plddt = (plddt * token_pad_mask).sum(axis=-1) / token_pad_mask.sum(
             axis=-1
         )
-        is_contact = (d < 8)
+        is_contact = d < 8
         is_different_chain = jnp.expand_dims(feats["asym_id"], -1) != jnp.expand_dims(
             feats["asym_id"], -2
         )
@@ -1616,7 +1568,7 @@ class ConfidenceHeads(AbstractFromTorch):
         complex_ipae = (pae * token_interface_pair_mask).sum(axis=(1, 2)) / (
             token_interface_pair_mask.sum(axis=(1, 2)) + 1e-5
         )
-        
+
         out_dict = dict(
             pde_logits=pde_logits,
             plddt_logits=plddt_logits,
@@ -1825,8 +1777,7 @@ class Joltz1(eqx.Module):
                         s_inputs=s_inputs,
                         s=s,
                         z=z,
-                        s_diffusion=dict_out["diff_token_repr"]   
-                        ,
+                        s_diffusion=dict_out["diff_token_repr"],
                         x_pred=dict_out["sample_atom_coords"],
                         feats=feats,
                         pred_distogram_logits=dict_out["pdistogram"],

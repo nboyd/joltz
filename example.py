@@ -3,7 +3,6 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-import boltz
 import equinox as eqx
 import jax
 import numpy as np
@@ -18,8 +17,6 @@ from boltz.main import (
     process_inputs,
 )
 from boltz.model.model import Boltz1
-from jax import numpy as jnp
-from optax.losses import softmax_cross_entropy
 
 import joltz
 
@@ -38,19 +35,17 @@ predict_args = {
 print("Loading torch model")
 start_time = time.time()
 torch_model = Boltz1.load_from_checkpoint(
-        Path("~/.boltz/boltz1_conf.ckpt").expanduser(),
-        strict=True,
-        map_location="cpu",
-        predict_args=predict_args,
-        diffusion_process_args=asdict(BoltzDiffusionParams()),
-        ema=False,
-    )
+    Path("~/.boltz/boltz1_conf.ckpt").expanduser(),
+    strict=True,
+    map_location="cpu",
+    predict_args=predict_args,
+    diffusion_process_args=asdict(BoltzDiffusionParams()),
+    ema=False,
+)
 print(f"Boltz1.load_from_checkpoint: {time.time() - start_time: 0.3f}s")
 print("Converting to JAX")
 start_time = time.time()
-joltz_model = joltz.from_torch(
-    torch_model
-)
+joltz_model = joltz.from_torch(torch_model)
 print(f"joltz.from_torch(torch_model): {time.time() - start_time: 0.3f}s")
 
 
@@ -90,11 +85,6 @@ data_module = BoltzInferenceDataModule(
 # Load the features for the single example
 features_dict = list(data_module.predict_dataloader())[0]
 
-# print("troching")
-# start_time = time.time()
-# torch_model(features_dict)
-# print(f"torch_model(features_dict): {time.time() - start_time: 0.3f}s")
-
 # convert features to numpy arrays
 jax_features = {k: np.array(v) for k, v in features_dict.items() if k != "record"}
 
@@ -105,7 +95,6 @@ jit_joltz = eqx.filter_jit(joltz_model)
 start_time = time.time()
 prediction = jit_joltz(jax_features)
 print(f"joltz(jax_features): {time.time() - start_time: 0.3f}s")
-
 
 
 start_time = time.time()
@@ -163,5 +152,3 @@ shutil.copy(
     out_dir / "predictions/test/test_model_0.pdb",
     out_dir / "predictions/test/original.pdb",
 )
-
-

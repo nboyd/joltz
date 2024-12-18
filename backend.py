@@ -14,7 +14,6 @@ from functools import partial
 import numpy as np
 
 
-
 @singledispatch
 def from_torch(x):
     raise NotImplementedError(f"from_torch not implemented for {type(x)}: {x}")
@@ -32,8 +31,6 @@ from_torch.register(torch.nn.ReLU, lambda _: jax.nn.relu)
 from_torch.register(torch.nn.Sigmoid, lambda _: jax.nn.sigmoid)
 from_torch.register(torch.nn.SiLU, lambda _: jax.nn.silu)
 from_torch.register(torch.nn.ModuleList, lambda x: [from_torch(m) for m in x])
-
-
 
 
 class AbstractFromTorch(eqx.Module):

@@ -48,7 +48,7 @@ from jax import numpy as jnp
 from jax import tree, vmap
 from jaxtyping import Array, Bool, Float
 
-from backend import (
+from .backend import (
     AbstractFromTorch,
     LayerNorm,
     Linear,

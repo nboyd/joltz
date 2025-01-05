@@ -1,7 +1,7 @@
 [project]
 name = "joltz"
 version = "0.1.0"
-description = "Add your description here"
+description = "JAX translation of Boltz-1"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,5 +11,4 @@ dependencies = [
     "jax>=0.4.37",
     "jaxtyping>=0.2.36",
     "numpy>=1.26.3",
-    "optax>=0.2.4",
 ]

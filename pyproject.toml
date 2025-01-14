@@ -12,3 +12,6 @@ dependencies = [
     "jaxtyping>=0.2.36",
     "numpy>=1.26.3",
 ]
+
+[tool.uv]
+package = true

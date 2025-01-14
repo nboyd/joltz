@@ -7,14 +7,16 @@ Work in progress, any feedback/PRs welcome!
 
 Tested with boltz 0.3.2; will almost certainly break with more recent versions.
 
+For an example of how to use this for protein design using hallucination see [boltz-binder-design](https://github.com/escalante-bio/boltz-binder-design).
+
 #### TODO:
-- [~] Finish confidence module
+- [x] Finish confidence module
 - [ ] Chunking
 - [x] Model cache
 - [ ] Dropout
 - [ ] Fix structure module on CPU
 - [ ] Refactor to remove explicit batching
-- [ ] Replace dictionaries with `eqx.Module`s
+- [x] Replace dictionaries with `eqx.Module`s
 
 
 

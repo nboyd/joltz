@@ -7,6 +7,8 @@ Work in progress, any feedback/PRs welcome!
 
 Tested with boltz 0.3.2; will almost certainly break with more recent versions.
 
+For an example of how to use this for protein design using hallucination see [boltz-binder-design](https://github.com/escalante-bio/boltz-binder-design).
+
 #### TODO:
 - [x] Finish confidence module
 - [ ] Chunking

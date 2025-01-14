@@ -16,7 +16,6 @@ This file contains translations of Boltz-1 modules.
 
 
 """
-# TODO: Finish confidence module
 # TODO: This is basically a line-by-line translation: could make it more "equinox-y"
 #   (e.g. no explicit batches, use dataclasses/eqx.Modules instead of dicts, use jaxtyping properly, etc)
 # TODO: Chunking
@@ -47,6 +46,8 @@ from boltz.data import const
 from jax import numpy as jnp
 from jax import tree, vmap
 from jaxtyping import Array, Bool, Float
+
+from dataclasses import asdict
 
 from .backend import (
     AbstractFromTorch,
@@ -1270,6 +1271,10 @@ def weighted_rigid_align(
     return aligned_coords
 
 
+class StructureModuleOutputs(eqx.Module):
+    sample_atom_coords: Float[Array, "B N 3"]
+    diff_token_repr: Float[Array, "B N 768"]
+
 @register_from_torch(boltz.model.modules.diffusion.AtomDiffusion)
 class AtomDiffusion(AbstractFromTorch):
     score_model: DiffusionModule
@@ -1373,7 +1378,7 @@ class AtomDiffusion(AbstractFromTorch):
         s_inputs,
         feats,
         relative_position_encoding,
-    ):
+    ) -> StructureModuleOutputs:
         assert multiplicity == 1
         B, N, _ = s_trunk.shape
 
@@ -1476,10 +1481,7 @@ class AtomDiffusion(AbstractFromTorch):
         state = (atom_coords, atom_coords_denoised, token_repr, token_a)
         state, _ = jax.lax.scan(body_fn, state, sigmas_and_gammas)
 
-        return {
-            "sample_atom_coords": state[0],
-            "diff_token_repr": state[2],
-        }
+        return StructureModuleOutputs(sample_atom_coords=state[0], diff_token_repr=state[2])
 
 
 def compute_aggregated_metric(logits, end=1.0):
@@ -1702,6 +1704,18 @@ class ConfidenceModule(eqx.Module):
         )
 
 
+
+class TrunkState(eqx.Module):
+    s: Float[Array, "B N 384"]
+    z: Float[Array, "B N N D"]
+
+class TrunkOutputs(eqx.Module):
+    s: Float[Array, "B N 384"]
+    z: Float[Array, "B N N D"]
+    s_inputs: Float[Array, "B N P"]
+    pdistogram: Float[Array, "B N N 64"]
+    
+
 @register_from_torch(boltz.model.model.Boltz1)
 class Joltz1(eqx.Module):
     distogram_module: Distogram
@@ -1720,15 +1734,7 @@ class Joltz1(eqx.Module):
     structure_module: AtomDiffusion
     confidence_module: ConfidenceModule
 
-    def __call__(
-        self,
-        feats: dict,
-        recycling_steps: int = 0,
-        num_sampling_steps: int = 25,
-        sample_structure: bool = False,
-        confidence_prediction: bool = False,
-        key=None,
-    ):
+    def embed_inputs(self, feats: dict) -> tuple[TrunkState, TrunkState, jax.Array]:
         with jax.default_matmul_precision("float32"):
             s_inputs = self.input_embedder(feats)
             # Initialize the sequence and pairwise embeddings
@@ -1744,48 +1750,79 @@ class Joltz1(eqx.Module):
             # Perform rounds of the pairwise stack
             s = jnp.zeros_like(s_init)
             z = jnp.zeros_like(z_init)
+
+        return (TrunkState(s_init, z_init), TrunkState(s=s, z=z), s_inputs)
+
+    def recycling_iteration(self, init: TrunkState, state: TrunkState, s_inputs, feats: dict):
+        # One iteration of recyling
+        with jax.default_matmul_precision("float32"):
             mask = feats["token_pad_mask"]
             pair_mask = mask[:, :, None] * mask[:, None, :]
-            for i in range(recycling_steps + 1):
-                # Apply recycling
-                s = s_init + self.s_recycle(self.s_norm(s))
-                z = z_init + self.z_recycle(self.z_norm(z))
+            s = init.s + self.s_recycle(self.s_norm(state.s))
+            z = init.z + self.z_recycle(self.z_norm(state.z))
 
-                z = z + self.msa_module(z, s_inputs, feats)
+            z = z + self.msa_module(z, s_inputs, feats)
 
-                s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+            s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+            return TrunkState(s, z)
+    
+    def trunk(self, feats: dict, recycling_steps: int = 0) -> TrunkOutputs:
+        with jax.default_matmul_precision("float32"):
+            init, state, s_inputs = self.embed_inputs(feats)
+            for _ in range(recycling_steps + 1):
+                state = self.recycling_iteration(init, state, s_inputs, feats)
+            return TrunkOutputs(state.s, state.z, s_inputs, self.distogram_module(state.z))
 
-            dict_out = {"pdistogram": self.distogram_module(z)}
-
-            if sample_structure:
-                dict_out.update(
-                    self.structure_module.sample(
-                        s_trunk=s,
-                        z_trunk=z,
-                        s_inputs=s_inputs,
-                        feats=feats,
-                        relative_position_encoding=relative_position_encoding,
-                        num_sampling_steps=num_sampling_steps,
-                        atom_mask=feats["atom_pad_mask"],
-                        multiplicity=1,
-                        key=key,
-                    )
+    def sample_structure(self, feats: dict, trunk_output: TrunkOutputs, num_sampling_steps: int = 25, key = None) -> StructureModuleOutputs:
+        with jax.default_matmul_precision("float32"):
+            return self.structure_module.sample(
+                s_trunk=trunk_output.s,
+                z_trunk=trunk_output.z,
+                s_inputs=trunk_output.s_inputs,
+                feats=feats,
+                relative_position_encoding=self.rel_pos(feats),
+                num_sampling_steps=num_sampling_steps,
+                atom_mask=feats["atom_pad_mask"],
+                multiplicity=1,
+                key=key,
+            )
+    
+    def predict_confidence(self, feats: dict, trunk_output: TrunkOutputs, structure_output: StructureModuleOutputs) -> dict:
+        with jax.default_matmul_precision("float32"):
+            return self.confidence_module(
+                    s_inputs=trunk_output.s_inputs,
+                    s=trunk_output.s,
+                    z=trunk_output.z,
+                    s_diffusion=structure_output.diff_token_repr,
+                    x_pred=structure_output.sample_atom_coords,
+                    feats=feats,
+                    pred_distogram_logits=trunk_output.dict_out["pdistogram"],
+                    multiplicity=1,
                 )
-            if confidence_prediction:
-                dict_out.update(
-                    self.confidence_module(
-                        s_inputs=s_inputs,
-                        s=s,
-                        z=z,
-                        s_diffusion=dict_out["diff_token_repr"],
-                        x_pred=dict_out["sample_atom_coords"],
-                        feats=feats,
-                        pred_distogram_logits=dict_out["pdistogram"],
-                        multiplicity=1,
-                    )
-                )
+                
 
-            return dict_out
+
+
+    def __call__(
+        self,
+        feats: dict,
+        recycling_steps: int = 0,
+        num_sampling_steps: int = 25,
+        sample_structure: bool = False,
+        confidence_prediction: bool = False,
+        key=None,
+    ):
+        # Legacy-style call method that returns unstructured dict
+        trunk_embedding = self.trunk(feats, recycling_steps)
+        dict_out = {"pdistogram": trunk_embedding.pdistogram}
+        if sample_structure or confidence_prediction:
+            structure_output = self.sample_structure(feats, trunk_embedding, num_sampling_steps, key)
+            dict_out.update(asdict(structure_output))
+        
+        if confidence_prediction:
+            dict_out.update(self.predict_confidence(feats, trunk_embedding, structure_output))
+        
+        return dict_out
 
     @staticmethod
     def from_torch(m: boltz.model.model.Boltz1):

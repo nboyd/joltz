@@ -8,13 +8,13 @@ Work in progress, any feedback/PRs welcome!
 Tested with boltz 0.3.2; will almost certainly break with more recent versions.
 
 #### TODO:
-- [~] Finish confidence module
+- [x] Finish confidence module
 - [ ] Chunking
 - [x] Model cache
 - [ ] Dropout
 - [ ] Fix structure module on CPU
 - [ ] Refactor to remove explicit batching
-- [ ] Replace dictionaries with `eqx.Module`s
+- [x] Replace dictionaries with `eqx.Module`s
 
 
 

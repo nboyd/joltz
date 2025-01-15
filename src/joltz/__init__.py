@@ -1796,7 +1796,7 @@ class Joltz1(eqx.Module):
                     s_diffusion=structure_output.diff_token_repr,
                     x_pred=structure_output.sample_atom_coords,
                     feats=feats,
-                    pred_distogram_logits=trunk_output.dict_out["pdistogram"],
+                    pred_distogram_logits=trunk_output.pdistogram,
                     multiplicity=1,
                 )
                 

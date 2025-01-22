@@ -12,6 +12,7 @@ from jax import numpy as jnp
 from jaxtyping import Array, Float
 from functools import partial
 import numpy as np
+from jax import tree
 
 
 @singledispatch

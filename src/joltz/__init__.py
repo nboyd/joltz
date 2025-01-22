@@ -583,6 +583,7 @@ class DiffusionTransformer(eqx.Module):
         if pair_biases is None:
             pair_biases = self.precompute_pair_biases(z)
 
+        @jax.checkpoint
         def body_fn(a, params_and_bias):
             # reconstitute layer
             params, bias = params_and_bias
@@ -1419,6 +1420,7 @@ class AtomDiffusion(AbstractFromTorch):
             relative_position_encoding=relative_position_encoding,
         )
 
+        @jax.checkpoint
         def body_fn(state, sigmas_and_gammas):
             (atom_coords, atom_coords_denoised, token_repr, token_a) = state
             sigma_tm, sigma_t, gamma, key = sigmas_and_gammas

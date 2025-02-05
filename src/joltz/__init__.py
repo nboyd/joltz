@@ -19,7 +19,6 @@ This file contains translations of Boltz-1 modules.
 # TODO: This is basically a line-by-line translation: could make it more "equinox-y"
 #   (e.g. no explicit batches, use dataclasses/eqx.Modules instead of dicts, use jaxtyping properly, etc)
 # TODO: Chunking
-# TODO: Dropout
 
 from dataclasses import fields
 from functools import partial
@@ -79,7 +78,7 @@ def get_dropout_mask(
     dropout = dropout * training
     v = z[:, 0:1, :, 0:1] if columnwise else z[:, :, 0:1, 0:1]
     # d = torch.rand_like(v) > dropout
-    d = jax.random.bernoulli(key, dropout, v.shape) > 0
+    d = jax.random.bernoulli(key, 1 - dropout, v.shape) > 0
     d = d * 1.0 / (1.0 - dropout)
     return d, jax.random.fold_in(key, 0)
 
@@ -334,18 +333,31 @@ class MSALayer(AbstractFromTorch):
     tri_att_end: TriangleAttention
     z_transition: Transition
     outer_product_mean: OuterProductMean
+    msa_dropout: float
+    z_dropout: float
 
-    def __call__(self, z, m, token_mask, msa_mask):
-        m = m + self.pair_weighted_averaging(m, z, token_mask)
+    def __call__(self, z, m, key, token_mask, msa_mask, *, deterministic=False):
+        msa_dropout, key = get_dropout_mask(
+            self.msa_dropout, m, not deterministic, key=key
+        )
+        m = m + msa_dropout * self.pair_weighted_averaging(m, z, token_mask)
         m = m + self.msa_transition(m)
         z = z + self.outer_product_mean(m, msa_mask)
-        z = z + self.tri_mul_out(z, token_mask)
-        z = z + self.tri_mul_in(z, token_mask)
-        z = z + self.tri_att_start(z, token_mask)
-        z = z + self.tri_att_end(z, token_mask)
+
+        # pairwise stack
+        dropout, key = get_dropout_mask(self.z_dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_out(z, token_mask)
+        dropout, key = get_dropout_mask(self.z_dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_in(z, token_mask)
+        dropout, key = get_dropout_mask(self.z_dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_att_start(z, token_mask)
+        dropout, key = get_dropout_mask(
+            self.z_dropout, z, not deterministic, key=key, columnwise=True
+        )
+        z = z + dropout * self.tri_att_end(z, token_mask)
         z = z + self.z_transition(z)
 
-        return z, m
+        return z, m, key
 
 
 @register_from_torch(boltz.model.modules.trunk.MSAModule)
@@ -360,6 +372,9 @@ class MSAModule(eqx.Module):
         z: Float[Array, "B N N P"],
         emb: Float[Array, "B N D"],
         feats: dict[str, any],
+        *,
+        key,
+        deterministic=False,
     ) -> Float[Array, "B N N P"]:
         msa = feats["msa"]
         has_deletion = feats["has_deletion"][..., None]
@@ -375,10 +390,10 @@ class MSAModule(eqx.Module):
         @jax.checkpoint
         def body_fn(embedding, params):
             return eqx.combine(self.static, params)(
-                *embedding, token_mask, msa_mask
+                *embedding, token_mask, msa_mask, deterministic=deterministic
             ), None
 
-        return jax.lax.scan(body_fn, (z, m), self.stacked_params)[0][0]
+        return jax.lax.scan(body_fn, (z, m, key), self.stacked_params)[0][0]
 
     @staticmethod
     def from_torch(module: boltz.model.modules.trunk.MSAModule):
@@ -1684,8 +1699,7 @@ class ConfidenceModule(eqx.Module):
         s_diffusion,
         *,
         key,
-        deterministic = False
-        
+        deterministic=False,
     ):
         assert multiplicity == 1
         s_inputs = self.input_embedder(feats)
@@ -1725,9 +1739,11 @@ class ConfidenceModule(eqx.Module):
         z = z + distogram
         mask = feats["token_pad_mask"]
         pair_mask = mask[:, :, None] * mask[:, None, :]
-        z = z + self.msa_module(z, s_inputs, feats)
+        z = z + self.msa_module(z, s_inputs, feats, key = key, deterministic=deterministic)
 
-        s, z, _ = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask, key=key, deterministic=deterministic)
+        s, z, _ = self.pairformer_module(
+            s, z, mask=mask, pair_mask=pair_mask, key=key, deterministic=deterministic
+        )
 
         s, z = self.final_s_norm(s), self.final_z_norm(z)
 
@@ -1792,7 +1808,14 @@ class Joltz1(eqx.Module):
         return (TrunkState(s_init, z_init), TrunkState(s=s, z=z), s_inputs)
 
     def recycling_iteration(
-        self, init: TrunkState, state: TrunkState, s_inputs, feats: dict, *, key, deterministic = False
+        self,
+        init: TrunkState,
+        state: TrunkState,
+        s_inputs,
+        feats: dict,
+        *,
+        key,
+        deterministic=False,
     ):
         # One iteration of recyling
         with jax.default_matmul_precision("float32"):
@@ -1801,16 +1824,27 @@ class Joltz1(eqx.Module):
             s = init.s + self.s_recycle(self.s_norm(state.s))
             z = init.z + self.z_recycle(self.z_norm(state.z))
 
-            z = z + self.msa_module(z, s_inputs, feats)
+            z = z + self.msa_module(z, s_inputs, feats, key = key, deterministic=deterministic)
 
-            s, z, key = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask, key=key, deterministic=deterministic)
+            s, z, key = self.pairformer_module(
+                s,
+                z,
+                mask=mask,
+                pair_mask=pair_mask,
+                key=key,
+                deterministic=deterministic,
+            )
             return TrunkState(s, z), key
 
-    def trunk(self, feats: dict, recycling_steps: int = 0, *, key, deterministic = False) -> TrunkOutputs:
+    def trunk(
+        self, feats: dict, recycling_steps: int = 0, *, key, deterministic=False
+    ) -> TrunkOutputs:
         with jax.default_matmul_precision("float32"):
             init, state, s_inputs = self.embed_inputs(feats)
             for _ in range(recycling_steps + 1):
-                state, key = self.recycling_iteration(init, state, s_inputs, feats, key=key, deterministic=deterministic)
+                state, key = self.recycling_iteration(
+                    init, state, s_inputs, feats, key=key, deterministic=deterministic
+                )
             return TrunkOutputs(
                 state.s, state.z, s_inputs, self.distogram_module(state.z)
             )
@@ -1840,6 +1874,9 @@ class Joltz1(eqx.Module):
         feats: dict,
         trunk_output: TrunkOutputs,
         structure_output: StructureModuleOutputs,
+        *,
+        key,
+        deterministic=False,
     ) -> dict:
         with jax.default_matmul_precision("float32"):
             return self.confidence_module(
@@ -1851,6 +1888,8 @@ class Joltz1(eqx.Module):
                 feats=feats,
                 pred_distogram_logits=trunk_output.pdistogram,
                 multiplicity=1,
+                key=key,
+                deterministic=deterministic,
             )
 
     def __call__(
@@ -1861,10 +1900,12 @@ class Joltz1(eqx.Module):
         sample_structure: bool = False,
         confidence_prediction: bool = False,
         key=None,
-        deterministic = False
+        deterministic=False,
     ):
         # Legacy-style call method that returns unstructured dict
-        trunk_embedding = self.trunk(feats, recycling_steps, key=key, deterministic=deterministic)
+        trunk_embedding = self.trunk(
+            feats, recycling_steps, key=key, deterministic=deterministic
+        )
         dict_out = {"pdistogram": trunk_embedding.pdistogram}
         if sample_structure or confidence_prediction:
             structure_output = self.sample_structure(
@@ -1874,7 +1915,13 @@ class Joltz1(eqx.Module):
 
         if confidence_prediction:
             dict_out.update(
-                self.predict_confidence(feats, trunk_embedding, structure_output)
+                self.predict_confidence(
+                    feats,
+                    trunk_embedding,
+                    structure_output,
+                    key=key,
+                    deterministic=deterministic,
+                )
             )
 
         return dict_out

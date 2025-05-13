@@ -102,16 +102,16 @@ jit_joltz = eqx.filter_jit(joltz_model)
 
 # Now we can finally make a prediction
 start_time = time.time()
-prediction = jit_joltz(jax_features)
+prediction = jit_joltz(jax_features, key = jax.random.key(0))
 print(f"joltz(jax_features): {time.time() - start_time: 0.3f}s")
 
 
 start_time = time.time()
-jit_joltz(jax_features)  # slow
+jit_joltz(jax_features, key = jax.random.key(0))  # slow
 print(f"jit_joltz(jax_features): {time.time() - start_time: 0.3f}s")
 
 start_time = time.time()
-jit_joltz(jax_features)  # fast (?)
+jit_joltz(jax_features, key = jax.random.key(0))  # fast (?)
 print(f"jit_joltz(jax_features): {time.time() - start_time: 0.3f}s")
 
 # We can also run the structure module

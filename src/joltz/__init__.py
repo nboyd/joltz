@@ -22,6 +22,7 @@ This file contains translations of Boltz-1 modules.
 
 from dataclasses import fields
 from functools import partial
+import sys
 
 import boltz
 import boltz.model.layers.outer_product_mean
@@ -1480,7 +1481,7 @@ class AtomDiffusion(AbstractFromTorch):
             t_hat = sigma_tm * (1 + gamma)
             eps = (
                 self.noise_scale
-                * jnp.sqrt(t_hat**2 - sigma_tm**2)
+                * jnp.sqrt(t_hat**2 - sigma_tm**2 + 1E-8)
                 * jax.random.normal(key=key, shape=shape)
             )
             atom_coords_noisy = atom_coords + eps
@@ -1526,7 +1527,16 @@ class AtomDiffusion(AbstractFromTorch):
         )
 
         state = (atom_coords, atom_coords_denoised, token_repr, token_a)
-        state, _ = jax.lax.scan(body_fn, state, sigmas_and_gammas)
+
+        if set([d.device_kind for d in jax.devices()]) == {'cpu'}:
+            # For some reason the scan version of this causes NaN issues on the CPU
+            # As a terrible hack here we fall back to a for loop.
+            
+            sys.stderr.write("WARNING: no accelerator found - joltz structure prediction will be *very* slow!\n")
+            for i in range(sigmas.shape[0]):
+                state, _ = body_fn(state, jax.tree.map(lambda v: v[i], sigmas_and_gammas))
+        else:
+            state, _ = jax.lax.scan(body_fn, state, sigmas_and_gammas)
 
         return StructureModuleOutputs(
             sample_atom_coords=state[0], diff_token_repr=state[2]

@@ -31,7 +31,7 @@ import boltz.model.layers.transition
 import boltz.model.layers.triangular_attention.attention
 import boltz.model.layers.triangular_attention.primitives
 import boltz.model.layers.triangular_mult
-import boltz.model.model
+import boltz.model.models
 import boltz.model.modules.confidence
 import boltz.model.modules.diffusion
 import boltz.model.modules.trunk
@@ -1780,7 +1780,7 @@ class TrunkOutputs(eqx.Module):
     pdistogram: Float[Array, "B N N 64"]
 
 
-@register_from_torch(boltz.model.model.Boltz1)
+@register_from_torch(boltz.model.models.boltz1.Boltz1)
 class Joltz1(eqx.Module):
     distogram_module: Distogram
     msa_module: MSAModule
@@ -1937,7 +1937,7 @@ class Joltz1(eqx.Module):
         return dict_out
 
     @staticmethod
-    def from_torch(m: boltz.model.model.Boltz1):
+    def from_torch(m: boltz.model.models.boltz1.Boltz1):
         return Joltz1(
             **{k.name: from_torch(getattr(m, k.name)) for k in fields(Joltz1)}
         )

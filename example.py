@@ -17,9 +17,9 @@ from boltz.main import (
     Manifest,
     check_inputs,
     process_inputs,
-    download,
+    download_boltz1 as download,
 )
-from boltz.model.model import Boltz1
+from boltz.model.models.boltz1 import Boltz1
 
 import joltz
 
@@ -64,13 +64,15 @@ print("Loading data")
 
 out_dir = Path("test_prediction")
 cache = Path("~/.boltz/").expanduser()
-data = check_inputs(Path("test.fasta"), out_dir, override=True)
+data = check_inputs(Path("test.fasta"))
 # Process inputs
 ccd_path = cache / "ccd.pkl"
+mol_dir = cache / "mols"
 process_inputs(
     data=data,
     out_dir=out_dir,
     ccd_path=ccd_path,
+    mol_dir=mol_dir,
     use_msa_server=True,
     msa_server_url="https://api.colabfold.com",
     msa_pairing_strategy="greedy",
@@ -132,12 +134,12 @@ print(
 )
 
 
-# If we want to save a .pdb or .cif to disk we can again hijack the boltz machinery
+# If we want to save a .cif to disk we can again hijack the boltz machinery
 
 pred_writer = BoltzWriter(
     data_dir=processed.targets_dir,
     output_dir=out_dir / "predictions",
-    output_format="pdb",
+    output_format="mmcif",
 )
 _pred_dict = {
     "exception": False,
@@ -156,8 +158,8 @@ pred_writer.write_on_batch_end(
     None,
     None,
 )
-# Not sure how pred_writer works so I'm just going to move the output .pdb so it doesn't get clobbered
+# Not sure how pred_writer works so I'm just going to move the output .cif so it doesn't get clobbered
 shutil.copy(
-    out_dir / "predictions/test/test_model_0.pdb",
-    out_dir / "predictions/test/original.pdb",
+    out_dir / "predictions/test/test_model_0.cif",
+    out_dir / "predictions/test/original.cif",
 )

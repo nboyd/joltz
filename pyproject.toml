@@ -9,7 +9,6 @@ dependencies = [
     "einops>=0.8.0",
     "equinox>=0.11.10",
     "jaxtyping>=0.2.36",
-    "marimo>=0.13.15",
     "numpy>=1.26.3",
 ]
 

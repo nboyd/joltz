@@ -32,6 +32,7 @@ import boltz.model.layers.triangular_attention.attention
 import boltz.model.layers.triangular_attention.primitives
 import boltz.model.layers.triangular_mult
 import boltz.model.models
+import boltz.model.models.boltz1
 import boltz.model.modules.confidence
 import boltz.model.modules.diffusion
 import boltz.model.modules.trunk

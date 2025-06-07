@@ -55,7 +55,7 @@ from .backend import (
     register_from_torch,
     Sequential,
     Embedding,
-    Identity
+    Identity,
 )
 
 
@@ -1481,7 +1481,7 @@ class AtomDiffusion(AbstractFromTorch):
             t_hat = sigma_tm * (1 + gamma)
             eps = (
                 self.noise_scale
-                * jnp.sqrt(t_hat**2 - sigma_tm**2 + 1E-8)
+                * jnp.sqrt(t_hat**2 - sigma_tm**2 + 1e-8)
                 * jax.random.normal(key=key, shape=shape)
             )
             atom_coords_noisy = atom_coords + eps
@@ -1528,13 +1528,17 @@ class AtomDiffusion(AbstractFromTorch):
 
         state = (atom_coords, atom_coords_denoised, token_repr, token_a)
 
-        if set([d.device_kind for d in jax.devices()]) == {'cpu'}:
+        if set([d.device_kind for d in jax.devices()]) == {"cpu"}:
             # For some reason the scan version of this causes NaN issues on the CPU
             # As a terrible hack here we fall back to a for loop.
-            
-            sys.stderr.write("WARNING: no accelerator found - joltz structure prediction will be *very* slow!\n")
+
+            sys.stderr.write(
+                "WARNING: no accelerator found - joltz structure prediction will be *very* slow!\n"
+            )
             for i in range(sigmas.shape[0]):
-                state, _ = body_fn(state, jax.tree.map(lambda v: v[i], sigmas_and_gammas))
+                state, _ = body_fn(
+                    state, jax.tree.map(lambda v: v[i], sigmas_and_gammas)
+                )
         else:
             state, _ = jax.lax.scan(body_fn, state, sigmas_and_gammas)
 
@@ -1749,7 +1753,9 @@ class ConfidenceModule(eqx.Module):
         z = z + distogram
         mask = feats["token_pad_mask"]
         pair_mask = mask[:, :, None] * mask[:, None, :]
-        z = z + self.msa_module(z, s_inputs, feats, key = key, deterministic=deterministic)
+        z = z + self.msa_module(
+            z, s_inputs, feats, key=key, deterministic=deterministic
+        )
 
         s, z, _ = self.pairformer_module(
             s, z, mask=mask, pair_mask=pair_mask, key=key, deterministic=deterministic
@@ -1834,7 +1840,9 @@ class Joltz1(eqx.Module):
             s = init.s + self.s_recycle(self.s_norm(state.s))
             z = init.z + self.z_recycle(self.z_norm(state.z))
 
-            z = z + self.msa_module(z, s_inputs, feats, key = key, deterministic=deterministic)
+            z = z + self.msa_module(
+                z, s_inputs, feats, key=key, deterministic=deterministic
+            )
 
             s, z, key = self.pairformer_module(
                 s,
@@ -1943,8 +1951,6 @@ class Joltz1(eqx.Module):
         )
 
 
-
-
 ### Boltz-2
 @register_from_torch(boltz.model.modules.encodersv2.RelativePositionEncoder)
 class RelativePositionEncoder2(AbstractFromTorch):
@@ -1981,7 +1987,6 @@ class RelativePositionEncoder2(AbstractFromTorch):
             d_residue,
         )
 
-       
         d_residue = jnp.clip(
             d_residue + self.r_max,
             0,
@@ -2031,7 +2036,6 @@ class RelativePositionEncoder2(AbstractFromTorch):
             )
         )
         return p
-    
 
 
 # TODO: implement dropout
@@ -2054,11 +2058,11 @@ class PairformerLayer2(AbstractFromTorch):
         self,
         s: Float[Array, "B N D"],
         z: Float[Array, "B N N P"],
-        key,
         mask: Bool[Array, "B N"],
         pair_mask: Bool[Array, "B N N"],
         *,
         deterministic: bool = False,
+        key,
     ):
         dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
         z = z + dropout * self.tri_mul_out(z, pair_mask)
@@ -2075,15 +2079,52 @@ class PairformerLayer2(AbstractFromTorch):
         z = z + dropout * self.tri_att_end(z, pair_mask)
         z = z + self.transition_z(z)
 
-
         s_normed = self.pre_norm_s(s)
-        s = s + self.attention(
-            s=s_normed, z=z, mask=mask, k_in = s_normed
-        )
+        s = s + self.attention(s=s_normed, z=z, mask=mask, k_in=s_normed)
         s = s + self.transition_s(s)
         s = self.s_post_norm(s)
         return s, z, key
 
+
+@register_from_torch(boltz.model.layers.pairformer.PairformerModule)
+class Pairformer2(eqx.Module):
+    stacked_parameters: PairformerLayer2
+    static: PairformerLayer2
+
+    @staticmethod
+    def from_torch(m: boltz.model.layers.pairformer.PairformerModule):
+        layers = [from_torch(layer) for layer in m.layers]
+        _, static = eqx.partition(layers[0], eqx.is_inexact_array)
+        return Pairformer2(
+            tree.map(
+                lambda *v: jnp.stack(v, 0),
+                *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
+            ),
+            static,
+        )
+
+    def __call__(self, s, z, mask, pair_mask, *, key, deterministic=False):
+        """
+        s: Float[Array, "B N D"]
+        z: Float[Array, "B N N P"]
+        mask: Bool[Array, "B N"]
+        pair_mask: Bool[Array, "B N N"]
+        """
+
+        @jax.checkpoint
+        def _body_fn(carry, params):
+            s, z, key = carry
+            return eqx.combine(self.static, params)(
+                s, z, mask, pair_mask, key=key, deterministic=deterministic
+            ), None
+
+        (s, z, key), _ = jax.lax.scan(
+            _body_fn,
+            (s, z, key),
+            self.stacked_parameters,
+        )
+
+        return s, z
 
 
 @register_from_torch(boltz.model.layers.attentionv2.AttentionPairBias)
@@ -2092,7 +2133,7 @@ class AttentionPairBias2(AbstractFromTorch):
     num_heads: int
     head_dim: int
     inf: float
-   
+
     proj_q: Linear
     proj_k: Linear
     proj_v: Linear
@@ -2111,12 +2152,8 @@ class AttentionPairBias2(AbstractFromTorch):
         mask: Bool[Array, "B N N"],
         k_in: any,
     ):
-        
-        
-
         B = s.shape[0]
         assert s.ndim == 3
-
 
         q = self.proj_q(s).reshape(B, -1, self.num_heads, self.head_dim)
         k = self.proj_k(k_in).reshape(B, -1, self.num_heads, self.head_dim)
@@ -2155,9 +2192,16 @@ class AtomEncoder2(AbstractFromTorch):
     use_residue_feats_atoms: bool
     atoms_per_window_queries: int
     atoms_per_window_keys: int
-    structure_prediction: bool = False  # whether this is used for structure prediction or not
+    structure_prediction: bool = (
+        False  # whether this is used for structure prediction or not
+    )
 
-    def __call__(self, feats: dict, s_trunk = None | Float[Array, "B N Ts"], z = None | Float[Array, "b n n tz"]):
+    def __call__(
+        self,
+        feats: dict,
+        s_trunk=None | Float[Array, "B N Ts"],
+        z=None | Float[Array, "b n n tz"],
+    ):
         assert not self.structure_prediction, "Not implemented yet"
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"]  # Bool['b m'],
@@ -2186,7 +2230,9 @@ class AtomEncoder2(AbstractFromTorch):
             atom_to_token = feats["atom_to_token"]
             print("atom_to_token shape", atom_to_token.shape)
             print("res_feats shape", res_feats.shape)
-            atom_res_feats = atom_to_token @ res_feats#jnp.batch#jnp.bmm(atom_to_token, res_feats)
+            atom_res_feats = (
+                atom_to_token @ res_feats
+            )  # jnp.batch#jnp.bmm(atom_to_token, res_feats)
             atom_feats.append(atom_res_feats)
 
         atom_feats = jnp.concatenate(atom_feats, axis=-1)
@@ -2205,22 +2251,18 @@ class AtomEncoder2(AbstractFromTorch):
         atom_ref_pos_keys = to_keys(atom_ref_pos).reshape(B, K, 1, H, 3)
         d = atom_ref_pos_keys - atom_ref_pos_queries  # Float['b k w h 3']
         d_norm = jnp.sum(d * d, axis=-1, keepdims=True)  # Float['b k w h 1']
-        d_norm = 1 / (
-            1 + d_norm
-        )  # AF3 feeds in the reciprocal of the distance norm
+        d_norm = 1 / (1 + d_norm)  # AF3 feeds in the reciprocal of the distance norm
 
-        atom_mask_queries = atom_mask.reshape(B,K, W, 1).astype(bool)  # Bool['b k w 1']
+        atom_mask_queries = atom_mask.reshape(B, K, W, 1).astype(
+            bool
+        )  # Bool['b k w 1']
         atom_mask_keys = to_keys(atom_mask[..., None]).reshape(B, K, 1, H).astype(bool)
         atom_uid_queries = atom_uid.reshape(B, K, W, 1)
         atom_uid_keys = to_keys(atom_uid[..., None]).reshape(B, K, 1, H).astype(int)
 
         v = (
-            (
-                atom_mask_queries
-                & atom_mask_keys
-                & (atom_uid_queries == atom_uid_keys)
-            ).astype(jnp.float32)[..., None]  # Bool['b k w h 1']
-        )
+            atom_mask_queries & atom_mask_keys & (atom_uid_queries == atom_uid_keys)
+        ).astype(jnp.float32)[..., None]  # Bool['b k w h 1']
         p = self.embed_atompair_ref_pos(d) * v
         p = p + self.embed_atompair_ref_dist(d_norm) * v
         p = p + self.embed_atompair_mask(v) * v
@@ -2233,10 +2275,10 @@ class AtomEncoder2(AbstractFromTorch):
         return q, c, p, to_keys
 
 
-
-
 register_from_torch(boltz.model.modules.transformersv2.AdaLN)(AdaLN)
-register_from_torch(boltz.model.modules.transformersv2.ConditionedTransitionBlock)(ConditionedTransitionBlock)
+register_from_torch(boltz.model.modules.transformersv2.ConditionedTransitionBlock)(
+    ConditionedTransitionBlock
+)
 
 
 @register_from_torch(boltz.model.modules.transformersv2.DiffusionTransformerLayer)
@@ -2269,13 +2311,10 @@ class DiffusionTransformerLayer2(AbstractFromTorch):
         else:
             b = self.no_pair_bias_attn(s=b, mask=mask, k_in=k_in)
 
-
-
         # TODO: precompute pair bias
         b = self.output_projection(s) * b
         a = a + b
         return self.post_lnorm(a + self.transition(a, s))
-
 
 
 @register_from_torch(boltz.model.modules.transformersv2.DiffusionTransformer)
@@ -2285,22 +2324,27 @@ class DiffusionTransformer2(eqx.Module):
     static: DiffusionTransformerLayer2
     depth: int
 
-   
     def __call__(
-        self, a, s, bias: Float[Array, "b n n dp"] | None = None, mask=None | Bool[Array, "B N"], to_keys=None, multiplicity=1
+        self,
+        a,
+        s,
+        bias: Float[Array, "b n n dp"] | None = None,
+        mask=None | Bool[Array, "B N"],
+        to_keys=None,
+        multiplicity=1,
     ):
         if self.pair_bias_attn:
             B, N, M, D = bias.shape
-            L = self.depth#len(self.layers)
+            L = self.depth  # len(self.layers)
             bias = bias.reshape(B, N, M, L, D // L)
-            
+
         bias = einops.rearrange(bias, "... l p -> l ... p")
 
         @jax.checkpoint
         def body_fn(a, params_and_bias):
             # reconstitute layer
             params, bias = params_and_bias
-            
+
             layer = eqx.combine(self.static, params)
             return layer(a=a, s=s, bias=bias, mask=mask, to_keys=to_keys), None
 
@@ -2317,7 +2361,7 @@ class DiffusionTransformer2(eqx.Module):
                 *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
             ),
             static,
-            depth = len(layers)
+            depth=len(layers),
         )
 
 
@@ -2327,7 +2371,6 @@ class AtomTransformer2(AbstractFromTorch):
     attn_window_keys: int
     diffusion_transformer: DiffusionTransformer2
 
-   
     def __call__(self, q, c, bias, to_keys=None, mask=None, multiplicity=None):
         W = self.attn_window_queries
         H = self.attn_window_keys
@@ -2341,17 +2384,17 @@ class AtomTransformer2(AbstractFromTorch):
             mask = mask.reshape(B * NW, W)
         bias = bias.reshape((bias.shape[0] * NW, W, H, -1))
 
-        to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(
-            B * NW, H, -1
-        )
-
-
+        to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(B * NW, H, -1)
 
         q = self.diffusion_transformer(
-            a=q, s=c, bias=bias, mask=mask, to_keys=to_keys_new, multiplicity=multiplicity
+            a=q,
+            s=c,
+            bias=bias,
+            mask=mask,
+            to_keys=to_keys_new,
+            multiplicity=multiplicity,
         )
 
-        
         return q.reshape((B, NW * W, D))
 
 
@@ -2362,7 +2405,16 @@ class AtomAttentionEncoder2(AbstractFromTorch):
     atom_to_token_trans: Sequential
     r_to_q_trans: Sequential | None
 
-    def __call__(self, feats: dict[str, any], q, c, atom_enc_bias, to_keys, r= None | Float[Array, "bm m 3"], multiplicity=1):
+    def __call__(
+        self,
+        feats: dict[str, any],
+        q,
+        c,
+        atom_enc_bias,
+        to_keys,
+        r=None | Float[Array, "bm m 3"],
+        multiplicity=1,
+    ):
         assert multiplicity == 1, "multiplicity must be 1 for Joltz"
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"].astype(bool)
@@ -2382,13 +2434,16 @@ class AtomAttentionEncoder2(AbstractFromTorch):
 
         q_to_a = self.atom_to_token_trans(q)
         atom_to_token = feats["atom_to_token"]
-        atom_to_token = atom_to_token#.repeat_interleave(multiplicity, 0)
+        atom_to_token = atom_to_token  # .repeat_interleave(multiplicity, 0)
         atom_to_token_mean = atom_to_token / (
             atom_to_token.sum(axis=1, keepdims=True) + 1e-6
         )
-        a = einops.rearrange(atom_to_token_mean, "A B C ... -> A C B ...") @ q_to_a#torch.bmm(atom_to_token_mean.transpose(1, 2), q_to_a)
+        a = (
+            einops.rearrange(atom_to_token_mean, "A B C ... -> A C B ...") @ q_to_a
+        )  # torch.bmm(atom_to_token_mean.transpose(1, 2), q_to_a)
 
         return a, q, c, to_keys
+
 
 @register_from_torch(boltz.model.modules.trunkv2.InputEmbedder)
 class InputEmbedder2(AbstractFromTorch):
@@ -2410,7 +2465,6 @@ class InputEmbedder2(AbstractFromTorch):
     modified_conditioning_init: Embedding | None
     cyclic_conditioning_init: Embedding | None
     mol_type_conditioning_init: Embedding | None
-
 
     def __call__(self, feats: dict[str, any], affinity: bool = False):
         res_type = feats["res_type"]
@@ -2434,7 +2488,9 @@ class InputEmbedder2(AbstractFromTorch):
         s = (
             a
             + self.res_type_encoding(res_type)
-            + self.msa_profile_encoding(jnp.concatenate([profile, deletion_mean], axis=-1))
+            + self.msa_profile_encoding(
+                jnp.concatenate([profile, deletion_mean], axis=-1)
+            )
         )
 
         if self.add_method_conditioning:
@@ -2449,10 +2505,11 @@ class InputEmbedder2(AbstractFromTorch):
 
         return s
 
+
 @register_from_torch(boltz.model.layers.pairformer.PairformerNoSeqLayer)
 class PairformerNoSeqLayer(AbstractFromTorch):
     token_z: int
-    dropout: float 
+    dropout: float
 
     tri_mul_out: TriangleMultiplicationOutgoing
     tri_mul_in: TriangleMultiplicationIncoming
@@ -2462,40 +2519,42 @@ class PairformerNoSeqLayer(AbstractFromTorch):
 
     transition_z: Transition
 
-    def __call__(self, z: Float[Array, "B N N D"], key, pair_mask, deterministic=False):
-        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=key)
-        z = z + dropout * self.tri_mul_out(z, mask = pair_mask)
+    def __call__(
+        self, z: Float[Array, "B N N D"], pair_mask, *, key, deterministic=False
+    ):
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_out(z, mask=pair_mask)
 
-        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 0))
-        z = z + dropout * self.tri_mul_in(z, mask = pair_mask)
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_in(z, mask=pair_mask)
 
-        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 1))
-        z = z + dropout * self.tri_att_start(z, mask = pair_mask)
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_att_start(z, mask=pair_mask)
 
-        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 2))
-        z = z + dropout * self.tri_att_end(z, mask = pair_mask)
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_att_end(z, mask=pair_mask)
         z = z + self.transition_z(z)
 
-        return self.z
+        return z
+
 
 @register_from_torch(boltz.model.layers.pairformer.PairformerNoSeqModule)
 class PairformerNoSeqModule(eqx.Module):
     stacked_parameters: PairformerNoSeqLayer
     static: PairformerNoSeqLayer
 
-
-    def __call__(
-        self, z, pair_mask, *, key, deterministic=False
-    ):
-        
+    def __call__(self, z, pair_mask, *, key, deterministic=False):
         @jax.checkpoint
         def body_fn(a, params):
             z, key = a
-            # reconstitute layer            
+            # reconstitute layer
             layer = eqx.combine(self.static, params)
-            return (layer(z, pair_mask, deterministic=deterministic, key = key), jax.random.fold_in(key, 0)), None
+            return (
+                layer(z, pair_mask, deterministic=deterministic, key=key),
+                jax.random.fold_in(key, 0),
+            ), None
 
-        return jax.lax.scan(body_fn, (z, key), self.stacked_parameters)[0]
+        return jax.lax.scan(body_fn, (z, key), self.stacked_parameters)[0][0]
 
     @staticmethod
     def from_torch(m: boltz.model.layers.pairformer.PairformerNoSeqModule):
@@ -2508,3 +2567,388 @@ class PairformerNoSeqModule(eqx.Module):
             ),
             static,
         )
+
+
+def cdist(
+    a: Float[Array, "B T N D"], b: Float[Array, "B T M D"]
+) -> Float[Array, "B T N M"]:
+    r = a[:, :, :, None, :] - b[:, :, None, :, :]
+    return jnp.sqrt(jnp.sum(r * r, axis=-1) + 1e-8)
+
+
+@register_from_torch(boltz.model.modules.trunkv2.TemplateV2Module)
+class TemplateV2Module(AbstractFromTorch):
+    min_dist: float
+    max_dist: float
+    num_bins: int
+    relu: any
+    z_norm: LayerNorm
+    v_norm: LayerNorm
+    z_proj: Linear
+    a_proj: Linear
+    u_proj: Linear
+    pairformer: PairformerNoSeqModule
+
+    def __call__(
+        self,
+        z: Float[Array, "B N N D"],
+        feats: dict[str],
+        pair_mask: Bool[Array, "B N N"],
+        *,
+        key,
+        deterministic,
+    ):
+        res_type = feats["template_restype"]
+        frame_rot = feats["template_frame_rot"]
+        frame_t = feats["template_frame_t"]
+        frame_mask = feats["template_mask_frame"]
+        cb_coords = feats["template_cb"]
+        ca_coords = feats["template_ca"]
+        cb_mask = feats["template_mask_cb"]
+        visibility_ids = feats["visibility_ids"]
+        template_mask = jnp.any(feats["template_mask"], axis=2)
+        num_templates = template_mask.sum(axis=1)
+        num_templates = num_templates.clip(min=1)
+
+        # Compute pairwise masks
+        b_cb_mask = cb_mask[:, :, :, None] * cb_mask[:, :, None, :]
+        b_frame_mask = frame_mask[:, :, :, None] * frame_mask[:, :, None, :]
+
+        b_cb_mask = b_cb_mask[..., None]
+        b_frame_mask = b_frame_mask[..., None]
+
+        # Compute asym mask, template features only attend within the same chain
+        B, T = res_type.shape[:2]  # noqa: N806
+        tmlp_pair_mask = visibility_ids[:, :, :, None] == visibility_ids[:, :, None, :]
+
+        # Compute distogram
+        cb_dists = cdist(cb_coords, cb_coords)
+        boundaries = jnp.linspace(self.min_dist, self.max_dist, self.num_bins - 1)
+        distogram = (cb_dists[..., None] > boundaries).sum(axis=-1).astype(jnp.int32)
+        distogram = jax.nn.one_hot(distogram, num_classes=self.num_bins)
+        # Compute unit vector in each frame
+        frame_rot = einops.rearrange(frame_rot[:, :, None, ...], "... a b -> ... b a")
+        frame_t = frame_t[:, :, None, ...][..., None]
+        ca_coords = ca_coords[:, :, :, None, ...][..., None]
+        vector = frame_rot @ (ca_coords - frame_t)
+        norm = jnp.linalg.norm(vector, axis=-1, keepdims=True)
+        unit_vector = jnp.where(norm > 0, vector / norm, jnp.zeros_like(vector))
+        unit_vector = unit_vector[..., 0]
+
+        a_tij = jnp.concatenate(
+            [
+                distogram,
+                b_cb_mask,
+                unit_vector,
+                b_frame_mask,
+            ],
+            axis=-1,
+        )
+        a_tij = a_tij * tmlp_pair_mask[..., None]
+
+        res_type_i = res_type[:, :, :, None]
+        res_type_j = res_type[:, :, None, :]
+        s_i = res_type_i.shape
+        res_type_i = jnp.broadcast_to(
+            res_type_i, (s_i[0], s_i[1], s_i[2], res_type.shape[2], s_i[4])
+        )
+        s_j = res_type_j.shape
+        res_type_j = jnp.broadcast_to(
+            res_type_j, (s_j[0], s_j[1], res_type.shape[2], s_j[3], s_j[4])
+        )
+        a_tij = jnp.concatenate([a_tij, res_type_i, res_type_j], axis=-1)
+        a_tij = self.a_proj(a_tij)
+
+        s_m = pair_mask.shape
+        pair_mask = jnp.broadcast_to(pair_mask[:, None], (s_m[0], T, s_m[1], s_m[2]))
+        pair_mask = pair_mask.reshape(B * T, *pair_mask.shape[2:])
+
+        v = self.z_proj(self.z_norm(z[:, None])) + a_tij
+        v = v.reshape(B * T, *v.shape[2:])
+        v = v + self.pairformer(v, pair_mask, key=key, deterministic=deterministic)
+        v = self.v_norm(v)
+        v = v.reshape(B, T, *v.shape[1:])
+
+        template_mask = template_mask[:, :, None, None, None]
+        num_templates = num_templates[:, None, None, None]
+        u = (v * template_mask).sum(axis=1) / num_templates
+
+        return self.u_proj(self.relu(u))
+
+
+@register_from_torch(boltz.model.modules.trunkv2.MSALayer)
+class MSALayer2(AbstractFromTorch):
+    msa_dropout: float
+    msa_transition: Transition
+    pair_weighted_averaging: PairWeightedAveraging
+    pairformer_layer: PairformerNoSeqLayer
+    outer_product_mean: OuterProductMean
+
+    def __call__(self, z, m, token_mask, msa_mask, *, key, deterministic=False):
+        msa_dropout, key = get_dropout_mask(
+            self.msa_dropout, m, not deterministic, key=key
+        )
+        m = m + msa_dropout * self.pair_weighted_averaging(m, z, token_mask)
+
+        m = m + self.msa_transition(m)
+
+        z = z + self.outer_product_mean(m, msa_mask)
+        
+        z = self.pairformer_layer(z, token_mask, key=jax.random.fold_in(key,0), deterministic=deterministic)
+
+        return z, m
+
+
+@register_from_torch(boltz.model.modules.trunkv2.MSAModule)
+class MSAModule2(eqx.Module):
+    use_paired_feature: bool
+    subsample_msa: bool
+    num_subsampled_msa: int
+    msa_proj: Linear
+    s_proj: Linear
+    msa_dropout: float
+
+    stacked_parameters: MSALayer2
+    static: MSALayer2
+
+    @staticmethod
+    def from_torch(m: boltz.model.modules.trunkv2.MSAModule):
+        layers = [from_torch(layer) for layer in m.layers]
+        _, static = eqx.partition(layers[0], eqx.is_inexact_array)
+        return MSAModule2(
+            m.use_paired_feature,
+            m.subsample_msa,
+            m.num_subsampled_msa,
+            from_torch(m.msa_proj),
+            from_torch(m.s_proj),
+            m.msa_dropout,
+            tree.map(
+                lambda *v: jnp.stack(v, 0),
+                *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
+            ),
+            static,
+        )
+
+    def __call__(self, z, emb, feats, *, key, deterministic=False):
+        """
+        z: Float[Array, "B N N D"]
+        emb: Float[Array, "B N P"]
+        feats: dict[str, any]
+        """
+
+        msa = feats["msa"]
+        msa = jax.nn.one_hot(msa, num_classes=const.num_tokens)
+        has_deletion = feats["has_deletion"][..., None]
+        deletion_value = feats["deletion_value"][..., None]
+        is_paired = feats["msa_paired"][..., None]
+        msa_mask = feats["msa_mask"]
+        token_mask = feats["token_pad_mask"].astype(jnp.float32)
+        token_mask = token_mask[:, :, None] * token_mask[:, None, :]
+
+        if self.use_paired_feature:
+            m = jnp.concatenate([msa, has_deletion, deletion_value, is_paired], axis=-1)
+        else:
+            m = jnp.concatenate([msa, has_deletion, deletion_value], axis=-1)
+
+        if self.subsample_msa:
+            msa_indices = jax.random.permutation(key, jnp.arange(msa.shape[1]))[
+                : self.num_subsampled_msa
+            ]
+            m = m[:, msa_indices]
+            msa_mask = msa_mask[:, msa_indices]
+
+        # Compute input projections
+        m = self.msa_proj(m)
+        m = m + self.s_proj(emb)[:, None, ...]
+
+        @jax.checkpoint
+        def body_fn(a, params):
+            z, m, key = a
+            # reconstitute layer
+            layer = eqx.combine(self.static, params)
+            return (
+                *layer(
+                    z=z,
+                    m=m,
+                    token_mask=token_mask,
+                    msa_mask=msa_mask,
+                    key=key,
+                    deterministic=deterministic,
+                ),
+                jax.random.fold_in(key, 0),
+            ), None
+
+        return jax.lax.scan(body_fn, (z, m, key), self.stacked_parameters)[0][0][
+            0
+        ]  # only return z
+
+
+register_from_torch(boltz.model.modules.trunkv2.FourierEmbedding)(FourierEmbedding)
+
+
+@register_from_torch(boltz.model.modules.trunkv2.ContactConditioning)
+class ContactConditioning(AbstractFromTorch):
+    fourier_embedding: FourierEmbedding
+    encoder: Linear
+    encoding_unspecified: Float[Array, "tz"]
+    encoding_unselected: Float[Array, "tz"]
+    cutoff_min: float
+    cutoff_max: float
+
+    def __call__(self, feats):
+        assert const.contact_conditioning_info["UNSPECIFIED"] == 0
+        assert const.contact_conditioning_info["UNSELECTED"] == 1
+
+        contact_conditioning = feats["contact_conditioning"][:, :, :, 2:]
+        contact_threshold = feats["contact_threshold"]
+        contact_threshold_normalized = (contact_threshold - self.cutoff_min) / (
+            self.cutoff_max - self.cutoff_min
+        )
+        contact_threshold_fourier = self.fourier_embedding(
+            contact_threshold_normalized.reshape(-1)
+        ).reshape(contact_threshold_normalized.shape + (-1,))
+
+        contact_conditioning = jnp.concatenate(
+            [
+                contact_conditioning,
+                contact_threshold_normalized[..., None],
+                contact_threshold_fourier,
+            ],
+            axis=-1,
+        )
+        contact_conditioning = self.encoder(contact_conditioning)
+
+        contact_conditioning = (
+            contact_conditioning
+            * (
+                1
+                - feats["contact_conditioning"][:, :, :, 0:2].sum(
+                    axis=-1, keepdims=True
+                )
+            )
+            + self.encoding_unspecified * feats["contact_conditioning"][:, :, :, 0:1]
+            + self.encoding_unselected * feats["contact_conditioning"][:, :, :, 1:2]
+        )
+        return contact_conditioning
+
+
+@register_from_torch(boltz.model.modules.trunkv2.DistogramModule)
+class DistogramModule2(AbstractFromTorch):
+    distogram: Linear
+    num_distograms: int
+    num_bins: int
+
+    def __call__(self, z: Float[Array, "B N N D"]):
+        z = z + einops.rearrange(z,"b n m d -> b m n d")
+        return self.distogram(z).reshape(
+            z.shape[0], z.shape[1], z.shape[2], self.num_distograms, self.num_bins
+        )
+       
+
+@register_from_torch(boltz.model.models.boltz2.Boltz2)
+class Joltz2(eqx.Module):
+    input_embedder: InputEmbedder2
+    s_init: Linear
+    z_init_1: Linear
+    z_init_2: Linear
+    rel_pos: RelativePositionEncoder2
+    token_bonds: Linear
+    bond_type_feature: bool
+    token_bonds_type: Embedding
+    contact_conditioning: ContactConditioning
+
+    s_norm: LayerNorm
+    s_recycle: Linear
+    z_norm: LayerNorm
+    z_recycle: Linear
+
+    distogram_module: DistogramModule2
+    msa_module: MSAModule2
+    template_module: TemplateV2Module
+    pairformer_module: Pairformer2
+
+    @staticmethod
+    def from_torch(m: boltz.model.models.boltz2.Boltz2):
+   
+
+        return Joltz2(
+            input_embedder=from_torch(m.input_embedder),
+            s_init=from_torch(m.s_init),
+            z_init_1=from_torch(m.z_init_1),
+            z_init_2=from_torch(m.z_init_2),
+            rel_pos=from_torch(m.rel_pos),
+            token_bonds=from_torch(m.token_bonds),
+            bond_type_feature=m.bond_type_feature,
+            token_bonds_type=from_torch(m.token_bonds_type),
+            contact_conditioning=from_torch(m.contact_conditioning),
+            s_norm=from_torch(m.s_norm),
+            s_recycle=from_torch(m.s_recycle),
+            z_norm=from_torch(m.z_norm),
+            z_recycle=from_torch(m.z_recycle),
+            distogram_module=from_torch(m.distogram_module),
+            template_module=from_torch(m.template_module),
+            msa_module=from_torch(m.msa_module),
+            pairformer_module=from_torch(m.pairformer_module)
+            
+            
+        )
+
+
+    def __call__(self, feats: dict[str], recycling_steps: int = 0, *, deterministic = False, key):
+        s_inputs = self.input_embedder(feats)
+
+        s_init = self.s_init(s_inputs)
+
+
+        z_init = (self.z_init_1(s_inputs)[:, :, None] +
+                  self.z_init_2(s_inputs)[:, None, :])
+        
+        relative_position_encoding = self.rel_pos(feats)
+
+        z_init = z_init + relative_position_encoding
+        z_init = z_init + self.token_bonds(feats["token_bonds"])
+        if self.bond_type_feature:
+            z_init = z_init + self.token_bonds_type(feats["type_bonds"].astype(jnp.int32))
+        z_init = z_init + self.contact_conditioning(feats) 
+
+        #return (s_init, z_init)
+
+        # Perform rounds of the pairwise stack
+        s = jnp.zeros_like(s_init)
+        z = jnp.zeros_like(z_init)
+
+        # Compute pairwise mask
+        mask = feats["token_pad_mask"]
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+        for i in range(recycling_steps + 1):
+            key = jax.random.fold_in(key, i)
+            # Apply recycling
+            s = s_init + self.s_recycle(self.s_norm(s))
+            z = z_init + self.z_recycle(self.z_norm(z))
+
+            # Compute pairwise stack
+            # if self.use_templates:
+            
+
+            z = z + self.template_module(
+                z, feats, pair_mask, deterministic=deterministic, key=key
+            )
+            
+            
+
+            z = z + self.msa_module(
+                z, s_inputs, feats, deterministic=deterministic, key=jax.random.fold_in(key, 0)
+            )
+
+            s, z = self.pairformer_module(
+                s,
+                z,
+                mask=mask,
+                pair_mask=pair_mask,
+                deterministic=deterministic,
+                key=jax.random.fold_in(key, 1),
+            )
+
+        pdistogram = self.distogram_module(z)
+        dict_out = {"pdistogram": pdistogram}
+        return dict_out

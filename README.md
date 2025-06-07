@@ -1,5 +1,5 @@
 ### Joltz
-`joltz` is a straightforward translation of [boltz-1](https://github.com/jwohlwend/boltz) from pytorch to JAX, which is compatable with all the nice features of JAX (JIT/vmap/etc).
+`joltz` is a straightforward translation of [boltz-1](https://github.com/jwohlwend/boltz) from pytorch to JAX, which is compatible with all the nice features of JAX (JIT/vmap/etc).
 
 For an example of how to load and use the model see the [example script](example.py).
 

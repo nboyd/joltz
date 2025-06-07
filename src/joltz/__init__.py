@@ -16,9 +16,6 @@ This file contains translations of Boltz-1 modules.
 
 
 """
-# TODO: This is basically a line-by-line translation: could make it more "equinox-y"
-#   (e.g. no explicit batches, use dataclasses/eqx.Modules instead of dicts, use jaxtyping properly, etc)
-# TODO: Chunking
 
 from dataclasses import fields
 from functools import partial
@@ -35,6 +32,7 @@ import boltz.model.models
 import boltz.model.models.boltz1
 import boltz.model.modules.confidence
 import boltz.model.modules.diffusion
+import boltz.model.modules.encodersv2
 import boltz.model.modules.trunk
 import boltz.model.modules.utils
 import einops
@@ -56,7 +54,8 @@ from .backend import (
     from_torch,
     register_from_torch,
     Sequential,
-    SparseEmbedding,
+    Embedding,
+    Identity
 )
 
 
@@ -1662,7 +1661,7 @@ class ConfidenceHeads(AbstractFromTorch):
 @register_from_torch(boltz.model.modules.confidence.ConfidenceModule)
 class ConfidenceModule(eqx.Module):
     boundaries: Float[Array, "B"]
-    dist_bin_pairwise_embed: SparseEmbedding
+    dist_bin_pairwise_embed: Embedding
     confidence_heads: ConfidenceHeads
     # copies of most trunk modules
     s_init: Linear
@@ -1941,4 +1940,571 @@ class Joltz1(eqx.Module):
     def from_torch(m: boltz.model.models.boltz1.Boltz1):
         return Joltz1(
             **{k.name: from_torch(getattr(m, k.name)) for k in fields(Joltz1)}
+        )
+
+
+
+
+### Boltz-2
+@register_from_torch(boltz.model.modules.encodersv2.RelativePositionEncoder)
+class RelativePositionEncoder2(AbstractFromTorch):
+    linear_layer: Linear
+    r_max: int
+    s_max: int
+    fix_sym_check: bool
+    cyclic_pos_enc: bool
+
+    def __call__(self, feats: dict[str, any]):
+        b_same_chain = jnp.equal(
+            feats["asym_id"][:, :, None], feats["asym_id"][:, None, :]
+        )
+        b_same_residue = jnp.equal(
+            feats["residue_index"][:, :, None], feats["residue_index"][:, None, :]
+        )
+        b_same_entity = jnp.equal(
+            feats["entity_id"][:, :, None], feats["entity_id"][:, None, :]
+        )
+
+        d_residue = (
+            feats["residue_index"][:, :, None] - feats["residue_index"][:, None, :]
+        )
+
+        period = jnp.where(
+            feats["cyclic_period"] > 0,
+            feats["cyclic_period"],
+            jnp.zeros_like(feats["cyclic_period"]) + 10000,
+        )
+
+        d_residue = jnp.where(
+            self.cyclic_pos_enc * jax.numpy.any(feats["cyclic_period"] > 0),
+            (d_residue - period * jnp.round(d_residue / period)),
+            d_residue,
+        )
+
+       
+        d_residue = jnp.clip(
+            d_residue + self.r_max,
+            0,
+            2 * self.r_max,
+        )
+        d_residue = jnp.where(
+            b_same_chain, d_residue, jnp.zeros_like(d_residue) + 2 * self.r_max + 1
+        )
+        a_rel_pos = jax.nn.one_hot(d_residue, 2 * self.r_max + 2)
+
+        d_token = jnp.clip(
+            feats["token_index"][:, :, None]
+            - feats["token_index"][:, None, :]
+            + self.r_max,
+            0,
+            2 * self.r_max,
+        )
+        d_token = jnp.where(
+            b_same_chain & b_same_residue,
+            d_token,
+            jnp.zeros_like(d_token) + 2 * self.r_max + 1,
+        )
+        a_rel_token = jax.nn.one_hot(d_token, 2 * self.r_max + 2)
+
+        d_chain = jnp.clip(
+            feats["sym_id"][:, :, None] - feats["sym_id"][:, None, :] + self.s_max,
+            0,
+            2 * self.s_max,
+        )
+        d_chain = jnp.where(
+            (~b_same_entity) if self.fix_sym_check else b_same_chain,
+            jnp.zeros_like(d_chain) + 2 * self.s_max + 1,
+            d_chain,
+        )
+        # Note: added  | (~b_same_entity) based on observation of ProteinX manuscript
+        a_rel_chain = jax.nn.one_hot(d_chain, 2 * self.s_max + 2)
+
+        p = self.linear_layer(
+            jnp.concatenate(
+                [
+                    a_rel_pos,
+                    a_rel_token,
+                    b_same_entity[..., None],
+                    a_rel_chain,
+                ],
+                axis=-1,
+            )
+        )
+        return p
+    
+
+
+# TODO: implement dropout
+@register_from_torch(boltz.model.layers.pairformer.PairformerLayer)
+class PairformerLayer2(AbstractFromTorch):
+    token_z: int  # pairwise embedding dimension
+    dropout: float
+    num_heads: int
+    attention: AttentionPairBias
+    tri_mul_out: TriangleMultiplicationOutgoing
+    tri_mul_in: TriangleMultiplicationIncoming
+    tri_att_start: TriangleAttention
+    tri_att_end: TriangleAttention
+    transition_s: Transition
+    transition_z: Transition
+    pre_norm_s: LayerNorm
+    s_post_norm: LayerNorm
+
+    def __call__(
+        self,
+        s: Float[Array, "B N D"],
+        z: Float[Array, "B N N P"],
+        key,
+        mask: Bool[Array, "B N"],
+        pair_mask: Bool[Array, "B N N"],
+        *,
+        deterministic: bool = False,
+    ):
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_out(z, pair_mask)
+
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_in(z, pair_mask)
+
+        dropout, key = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_att_start(z, pair_mask)
+
+        dropout, key = get_dropout_mask(
+            self.dropout, z, not deterministic, key=key, columnwise=True
+        )
+        z = z + dropout * self.tri_att_end(z, pair_mask)
+        z = z + self.transition_z(z)
+
+
+        s_normed = self.pre_norm_s(s)
+        s = s + self.attention(
+            s=s_normed, z=z, mask=mask, k_in = s_normed
+        )
+        s = s + self.transition_s(s)
+        s = self.s_post_norm(s)
+        return s, z, key
+
+
+
+@register_from_torch(boltz.model.layers.attentionv2.AttentionPairBias)
+class AttentionPairBias2(AbstractFromTorch):
+    c_s: int  # input sequence dim
+    num_heads: int
+    head_dim: int
+    inf: float
+   
+    proj_q: Linear
+    proj_k: Linear
+    proj_v: Linear
+    proj_g: Linear
+    proj_z: Sequential
+    proj_o: Linear
+
+    # def compute_pair_bias(self, z):
+    #     return self.proj_z(z)
+
+    def __call__(
+        self,
+        *,
+        s: Float[Array, "B S D"],
+        z: Float[Array, "B N N P"],
+        mask: Bool[Array, "B N N"],
+        k_in: any,
+    ):
+        
+        
+
+        B = s.shape[0]
+        assert s.ndim == 3
+
+
+        q = self.proj_q(s).reshape(B, -1, self.num_heads, self.head_dim)
+        k = self.proj_k(k_in).reshape(B, -1, self.num_heads, self.head_dim)
+        v = self.proj_v(k_in).reshape(B, -1, self.num_heads, self.head_dim)
+
+        bias = self.proj_z(z)
+
+        g = jax.nn.sigmoid(self.proj_g(s))
+
+        attn = jnp.einsum("bihd,bjhd->bhij", q, k)
+        attn = attn / (self.head_dim**0.5) + bias
+        attn = attn + (1 - mask[:, None, None]) * -self.inf
+        attn = jax.nn.softmax(attn, axis=-1)
+        o = jnp.einsum("bhij,bjhd->bihd", attn, v)
+        o = o.reshape(B, -1, self.c_s)
+        return self.proj_o(g * o)
+
+
+def get_indexing_matrix2(K, W, H):
+    # Just run this in torch and np the return array...
+    return np.array(boltz.model.modules.encodersv2.get_indexing_matrix(K, W, H, "cpu"))
+
+
+@register_from_torch(boltz.model.modules.encodersv2.AtomEncoder)
+class AtomEncoder2(AbstractFromTorch):
+    embed_atom_features: Linear
+    embed_atompair_ref_pos: Linear
+    embed_atompair_ref_dist: Linear
+    embed_atompair_mask: Linear
+    c_to_p_trans_k: Sequential
+    c_to_p_trans_q: Sequential
+    p_mlp: Sequential
+    s_to_c_trans: Sequential | None
+    use_no_atom_char: bool
+    use_atom_backbone_feat: bool
+    use_residue_feats_atoms: bool
+    atoms_per_window_queries: int
+    atoms_per_window_keys: int
+    structure_prediction: bool = False  # whether this is used for structure prediction or not
+
+    def __call__(self, feats: dict, s_trunk = None | Float[Array, "B N Ts"], z = None | Float[Array, "b n n tz"]):
+        assert not self.structure_prediction, "Not implemented yet"
+        B, N, _ = feats["ref_pos"].shape
+        atom_mask = feats["atom_pad_mask"]  # Bool['b m'],
+
+        atom_ref_pos = feats["ref_pos"]  # Float['b m 3'],
+        atom_uid = feats["ref_space_uid"]  # Long['b m'],
+
+        atom_feats = [
+            atom_ref_pos,
+            feats["ref_charge"][..., None],
+            feats["ref_element"],
+        ]
+        if not self.use_no_atom_char:
+            atom_feats.append(feats["ref_atom_name_chars"].reshape(B, N, 4 * 64))
+        if self.use_atom_backbone_feat:
+            atom_feats.append(feats["atom_backbone_feat"])
+        if self.use_residue_feats_atoms:
+            res_feats = jnp.concatenate(
+                [
+                    feats["res_type"],
+                    feats["modified"][..., None],
+                    jax.nn.one_hot(feats["mol_type"], num_classes=4),
+                ],
+                axis=-1,
+            )
+            atom_to_token = feats["atom_to_token"]
+            print("atom_to_token shape", atom_to_token.shape)
+            print("res_feats shape", res_feats.shape)
+            atom_res_feats = atom_to_token @ res_feats#jnp.batch#jnp.bmm(atom_to_token, res_feats)
+            atom_feats.append(atom_res_feats)
+
+        atom_feats = jnp.concatenate(atom_feats, axis=-1)
+
+        c = self.embed_atom_features(atom_feats)
+        # note we are already creating the windows to make it more efficient
+        W, H = self.atoms_per_window_queries, self.atoms_per_window_keys
+        B, N = c.shape[:2]
+        K = N // W
+        keys_indexing_matrix = get_indexing_matrix2(K, W, H)
+        to_keys = partial(
+            single_to_keys, indexing_matrix=keys_indexing_matrix, W=W, H=H
+        )
+
+        atom_ref_pos_queries = atom_ref_pos.reshape(B, K, W, 1, 3)
+        atom_ref_pos_keys = to_keys(atom_ref_pos).reshape(B, K, 1, H, 3)
+        d = atom_ref_pos_keys - atom_ref_pos_queries  # Float['b k w h 3']
+        d_norm = jnp.sum(d * d, axis=-1, keepdims=True)  # Float['b k w h 1']
+        d_norm = 1 / (
+            1 + d_norm
+        )  # AF3 feeds in the reciprocal of the distance norm
+
+        atom_mask_queries = atom_mask.reshape(B,K, W, 1).astype(bool)  # Bool['b k w 1']
+        atom_mask_keys = to_keys(atom_mask[..., None]).reshape(B, K, 1, H).astype(bool)
+        atom_uid_queries = atom_uid.reshape(B, K, W, 1)
+        atom_uid_keys = to_keys(atom_uid[..., None]).reshape(B, K, 1, H).astype(int)
+
+        v = (
+            (
+                atom_mask_queries
+                & atom_mask_keys
+                & (atom_uid_queries == atom_uid_keys)
+            ).astype(jnp.float32)[..., None]  # Bool['b k w h 1']
+        )
+        p = self.embed_atompair_ref_pos(d) * v
+        p = p + self.embed_atompair_ref_dist(d_norm) * v
+        p = p + self.embed_atompair_mask(v) * v
+
+        q = c
+
+        p = p + self.c_to_p_trans_q(c.reshape(B, K, W, 1, c.shape[-1]))
+        p = p + self.c_to_p_trans_k(to_keys(c).reshape(B, K, 1, H, c.shape[-1]))
+        p = p + self.p_mlp(p)
+        return q, c, p, to_keys
+
+
+
+
+register_from_torch(boltz.model.modules.transformersv2.AdaLN)(AdaLN)
+register_from_torch(boltz.model.modules.transformersv2.ConditionedTransitionBlock)(ConditionedTransitionBlock)
+
+
+@register_from_torch(boltz.model.modules.transformersv2.DiffusionTransformerLayer)
+class DiffusionTransformerLayer2(AbstractFromTorch):
+    adaln: AdaLN
+    pair_bias_attn: AttentionPairBias2
+    output_projection_linear: Linear
+    output_projection: Sequential
+    transition: ConditionedTransitionBlock
+    post_lnorm: LayerNorm | Identity
+
+    def __call__(self, *, a, s, bias, mask=None, to_keys=None):
+        assert self.pair_bias_attn
+        b = self.adaln(a, s)
+
+        assert a.ndim == 3
+
+        k_in = b
+        if to_keys is not None:
+            k_in = to_keys(b)
+            mask = to_keys(mask[..., None])[..., 0]
+
+        if self.pair_bias_attn:
+            b = self.pair_bias_attn(
+                s=b,
+                z=bias,
+                mask=mask,
+                k_in=k_in,
+            )
+        else:
+            b = self.no_pair_bias_attn(s=b, mask=mask, k_in=k_in)
+
+
+
+        # TODO: precompute pair bias
+        b = self.output_projection(s) * b
+        a = a + b
+        return self.post_lnorm(a + self.transition(a, s))
+
+
+
+@register_from_torch(boltz.model.modules.transformersv2.DiffusionTransformer)
+class DiffusionTransformer2(eqx.Module):
+    pair_bias_attn: bool
+    stacked_parameters: DiffusionTransformerLayer2
+    static: DiffusionTransformerLayer2
+    depth: int
+
+   
+    def __call__(
+        self, a, s, bias: Float[Array, "b n n dp"] | None = None, mask=None | Bool[Array, "B N"], to_keys=None, multiplicity=1
+    ):
+        if self.pair_bias_attn:
+            B, N, M, D = bias.shape
+            L = self.depth#len(self.layers)
+            bias = bias.reshape(B, N, M, L, D // L)
+            
+        bias = einops.rearrange(bias, "... l p -> l ... p")
+
+        @jax.checkpoint
+        def body_fn(a, params_and_bias):
+            # reconstitute layer
+            params, bias = params_and_bias
+            
+            layer = eqx.combine(self.static, params)
+            return layer(a=a, s=s, bias=bias, mask=mask, to_keys=to_keys), None
+
+        return jax.lax.scan(body_fn, a, (self.stacked_parameters, bias))[0]
+
+    @staticmethod
+    def from_torch(m: boltz.model.modules.transformersv2.DiffusionTransformer):
+        layers = [from_torch(layer) for layer in m.layers]
+        _, static = eqx.partition(layers[0], eqx.is_inexact_array)
+        return DiffusionTransformer2(
+            m.pair_bias_attn,
+            tree.map(
+                lambda *v: jnp.stack(v, 0),
+                *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
+            ),
+            static,
+            depth = len(layers)
+        )
+
+
+@register_from_torch(boltz.model.modules.transformersv2.AtomTransformer)
+class AtomTransformer2(AbstractFromTorch):
+    attn_window_queries: int
+    attn_window_keys: int
+    diffusion_transformer: DiffusionTransformer2
+
+   
+    def __call__(self, q, c, bias, to_keys=None, mask=None, multiplicity=None):
+        W = self.attn_window_queries
+        H = self.attn_window_keys
+        B, N, D = q.shape
+        NW = N // W
+
+        # reshape tokens
+        q = q.reshape((B * NW, W, -1))
+        c = c.reshape((B * NW, W, -1))
+        if mask is not None:
+            mask = mask.reshape(B * NW, W)
+        bias = bias.reshape((bias.shape[0] * NW, W, H, -1))
+
+        to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(
+            B * NW, H, -1
+        )
+
+
+
+        q = self.diffusion_transformer(
+            a=q, s=c, bias=bias, mask=mask, to_keys=to_keys_new, multiplicity=multiplicity
+        )
+
+        
+        return q.reshape((B, NW * W, D))
+
+
+@register_from_torch(boltz.model.modules.encodersv2.AtomAttentionEncoder)
+class AtomAttentionEncoder2(AbstractFromTorch):
+    structure_prediction: bool
+    atom_encoder: AtomTransformer
+    atom_to_token_trans: Sequential
+    r_to_q_trans: Sequential | None
+
+    def __call__(self, feats: dict[str, any], q, c, atom_enc_bias, to_keys, r= None | Float[Array, "bm m 3"], multiplicity=1):
+        assert multiplicity == 1, "multiplicity must be 1 for Joltz"
+        B, N, _ = feats["ref_pos"].shape
+        atom_mask = feats["atom_pad_mask"].astype(bool)
+
+        if self.structure_prediction:
+            r_to_q = self.r_to_q_trans(r)
+            q = q + r_to_q
+
+        q = self.atom_encoder(
+            q=q,
+            mask=atom_mask,
+            c=c,
+            bias=atom_enc_bias,
+            multiplicity=multiplicity,
+            to_keys=to_keys,
+        )
+
+        q_to_a = self.atom_to_token_trans(q)
+        atom_to_token = feats["atom_to_token"]
+        atom_to_token = atom_to_token#.repeat_interleave(multiplicity, 0)
+        atom_to_token_mean = atom_to_token / (
+            atom_to_token.sum(axis=1, keepdims=True) + 1e-6
+        )
+        a = einops.rearrange(atom_to_token_mean, "A B C ... -> A C B ...") @ q_to_a#torch.bmm(atom_to_token_mean.transpose(1, 2), q_to_a)
+
+        return a, q, c, to_keys
+
+@register_from_torch(boltz.model.modules.trunkv2.InputEmbedder)
+class InputEmbedder2(AbstractFromTorch):
+    token_s: int
+    add_method_conditioning: bool
+    add_modified_flag: bool
+    add_cyclic_flag: bool
+    add_mol_type_feat: bool
+
+    atom_encoder: AtomEncoder2
+    atom_enc_proj_z: Sequential
+
+    atom_attention_encoder: AtomAttentionEncoder2
+
+    res_type_encoding: Linear
+    msa_profile_encoding: Linear
+
+    method_conditioning_init: Embedding | None
+    modified_conditioning_init: Embedding | None
+    cyclic_conditioning_init: Embedding | None
+    mol_type_conditioning_init: Embedding | None
+
+
+    def __call__(self, feats: dict[str, any], affinity: bool = False):
+        res_type = feats["res_type"]
+        if affinity:
+            profile = feats["profile_affinity"]
+            deletion_mean = feats["deletion_mean_affinity"][..., None]
+        else:
+            profile = feats["profile"]
+            deletion_mean = feats["deletion_mean"][..., None]
+
+        q, c, p, to_keys = self.atom_encoder(feats)
+        atom_enc_bias = self.atom_enc_proj_z(p)
+        a, _, _, _ = self.atom_attention_encoder(
+            feats=feats,
+            q=q,
+            c=c,
+            atom_enc_bias=atom_enc_bias,
+            to_keys=to_keys,
+        )
+
+        s = (
+            a
+            + self.res_type_encoding(res_type)
+            + self.msa_profile_encoding(jnp.concatenate([profile, deletion_mean], axis=-1))
+        )
+
+        if self.add_method_conditioning:
+            s = s + self.method_conditioning_init(feats["method_feature"])
+        if self.add_modified_flag:
+            s = s + self.modified_conditioning_init(feats["modified"])
+        if self.add_cyclic_flag:
+            cyclic = feats["cyclic_period"].clip(max=1.0)[..., None]
+            s = s + self.cyclic_conditioning_init(cyclic)
+        if self.add_mol_type_feat:
+            s = s + self.mol_type_conditioning_init(feats["mol_type"])
+
+        return s
+
+@register_from_torch(boltz.model.layers.pairformer.PairformerNoSeqLayer)
+class PairformerNoSeqLayer(AbstractFromTorch):
+    token_z: int
+    dropout: float 
+
+    tri_mul_out: TriangleMultiplicationOutgoing
+    tri_mul_in: TriangleMultiplicationIncoming
+
+    tri_att_start: TriangleAttention
+    tri_att_end: TriangleAttention
+
+    transition_z: Transition
+
+    def __call__(self, z: Float[Array, "B N N D"], key, pair_mask, deterministic=False):
+        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=key)
+        z = z + dropout * self.tri_mul_out(z, mask = pair_mask)
+
+        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 0))
+        z = z + dropout * self.tri_mul_in(z, mask = pair_mask)
+
+        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 1))
+        z = z + dropout * self.tri_att_start(z, mask = pair_mask)
+
+        dropout = get_dropout_mask(self.dropout, z, not deterministic, key=jax.random.fold_in(key, 2))
+        z = z + dropout * self.tri_att_end(z, mask = pair_mask)
+        z = z + self.transition_z(z)
+
+        return self.z
+
+@register_from_torch(boltz.model.layers.pairformer.PairformerNoSeqModule)
+class PairformerNoSeqModule(eqx.Module):
+    stacked_parameters: PairformerNoSeqLayer
+    static: PairformerNoSeqLayer
+
+
+    def __call__(
+        self, z, pair_mask, *, key, deterministic=False
+    ):
+        
+        @jax.checkpoint
+        def body_fn(a, params):
+            z, key = a
+            # reconstitute layer            
+            layer = eqx.combine(self.static, params)
+            return (layer(z, pair_mask, deterministic=deterministic, key = key), jax.random.fold_in(key, 0)), None
+
+        return jax.lax.scan(body_fn, (z, key), self.stacked_parameters)[0]
+
+    @staticmethod
+    def from_torch(m: boltz.model.layers.pairformer.PairformerNoSeqModule):
+        layers = [from_torch(layer) for layer in m.layers]
+        _, static = eqx.partition(layers[0], eqx.is_inexact_array)
+        return PairformerNoSeqModule(
+            tree.map(
+                lambda *v: jnp.stack(v, 0),
+                *[eqx.filter(layer, eqx.is_inexact_array) for layer in layers],
+            ),
+            static,
         )

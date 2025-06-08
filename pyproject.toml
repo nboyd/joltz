@@ -5,7 +5,7 @@ description = "JAX translation of Boltz-1"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "boltz>=2.0.0",
+    "boltz>=2.0.3",
     "einops>=0.8.0",
     "equinox>=0.11.10",
     "jaxtyping>=0.2.36",
@@ -30,6 +30,3 @@ conflicts = [
     ],
 ]
 override-dependencies = ["scipy==1.15.1"]
-
-[tool.uv.sources]
-boltz = { path = "../boltz", editable = true }

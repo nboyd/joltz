@@ -68,7 +68,7 @@ data = check_inputs(Path("test.fasta"))
 # Process inputs
 ccd_path = cache / "ccd.pkl"
 mol_dir = cache / "mols"
-process_inputs(
+manifest = process_inputs(
     data=data,
     out_dir=out_dir,
     ccd_path=ccd_path,
@@ -80,7 +80,7 @@ process_inputs(
 # Load processed data
 processed_dir = out_dir / "processed"
 processed = BoltzProcessedInput(
-    manifest=Manifest.load(processed_dir / "manifest.json"),
+    manifest=manifest.load(processed_dir / "manifest.json"),
     targets_dir=processed_dir / "structures",
     msa_dir=processed_dir / "msa",
 )

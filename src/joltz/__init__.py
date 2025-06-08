@@ -25,6 +25,7 @@ import boltz
 import boltz.model.layers.outer_product_mean
 import boltz.model.layers.pair_averaging
 import boltz.model.layers.transition
+import boltz.model.layers.pairformer
 import boltz.model.layers.triangular_attention.attention
 import boltz.model.layers.triangular_attention.primitives
 import boltz.model.layers.triangular_mult
@@ -35,6 +36,8 @@ import boltz.model.modules.diffusion
 import boltz.model.modules.encodersv2
 import boltz.model.modules.trunk
 import boltz.model.modules.utils
+import boltz.model.modules.trunkv2
+import boltz.model.models.boltz2
 import einops
 import equinox as eqx
 import jax
@@ -2737,7 +2740,7 @@ class MSAModule2(eqx.Module):
         """
 
         msa = feats["msa"]
-        msa = jax.nn.one_hot(msa, num_classes=const.num_tokens)
+        #msa = jax.nn.one_hot(msa, num_classes=const.num_tokens)
         has_deletion = feats["has_deletion"][..., None]
         deletion_value = feats["deletion_value"][..., None]
         is_paired = feats["msa_paired"][..., None]

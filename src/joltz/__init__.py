@@ -22,10 +22,6 @@ from functools import partial
 import sys
 
 import boltz
-import boltz.model
-import boltz.model.layers
-import boltz.model.modules
-import boltz.model.models
 import boltz.model.layers.outer_product_mean
 import boltz.model.layers.pair_averaging
 import boltz.model.layers.transition
@@ -36,6 +32,8 @@ import boltz.model.layers.triangular_mult
 import boltz.model.models.boltz1
 import boltz.model.modules.confidence
 import boltz.model.modules.diffusion
+import boltz.model.modules.diffusion_conditioning
+import boltz.model.modules.diffusionv2
 import boltz.model.modules.encodersv2
 import boltz.model.modules.trunk
 import boltz.model.modules.utils
@@ -1054,7 +1052,7 @@ class AtomAttentionDecoder(AbstractFromTorch):
 
         atom_to_token = feats["atom_to_token"]
         a_to_q = self.a_to_q_trans(a)
-        a_to_q = vmap(lambda M, v: M @ v)(atom_to_token, a_to_q)
+        a_to_q = atom_to_token @ a_to_q#vmap(lambda M, v: M @ v)(atom_to_token, a_to_q)
         q = q + a_to_q
         q = self.atom_decoder(
             q=q,
@@ -1268,7 +1266,7 @@ def center_random_augmentation(
 
     return atom_coords
 
-
+@eqx.filter_jit
 def weighted_rigid_align(
     true_coords,
     pred_coords,
@@ -1313,6 +1311,7 @@ def weighted_rigid_align(
     F = F.at[:, -1, -1].set(jnp.linalg.det(rot_matrix))
     rot_matrix = vmap(lambda U, F, Vh: U @ F @ Vh)(U, F, Vh)
     rot_matrix = jax.lax.stop_gradient(rot_matrix)
+    pred_centroid = jax.lax.stop_gradient(pred_centroid)    
 
     # Apply the rotation and translation
     aligned_coords = (
@@ -2198,9 +2197,9 @@ class AtomEncoder2(AbstractFromTorch):
     use_residue_feats_atoms: bool
     atoms_per_window_queries: int
     atoms_per_window_keys: int
-    structure_prediction: bool = (
-        False  # whether this is used for structure prediction or not
-    )
+    structure_prediction: bool 
+    s_to_c_trans: Sequential | None
+    z_to_p_trans: Sequential | None
 
     def __call__(
         self,
@@ -2208,7 +2207,6 @@ class AtomEncoder2(AbstractFromTorch):
         s_trunk=None | Float[Array, "B N Ts"],
         z=None | Float[Array, "b n n tz"],
     ):
-        assert not self.structure_prediction, "Not implemented yet"
         B, N, _ = feats["ref_pos"].shape
         atom_mask = feats["atom_pad_mask"]  # Bool['b m'],
 
@@ -2234,8 +2232,7 @@ class AtomEncoder2(AbstractFromTorch):
                 axis=-1,
             )
             atom_to_token = feats["atom_to_token"]
-            print("atom_to_token shape", atom_to_token.shape)
-            print("res_feats shape", res_feats.shape)
+
             atom_res_feats = (
                 atom_to_token @ res_feats
             )  # jnp.batch#jnp.bmm(atom_to_token, res_feats)
@@ -2274,6 +2271,26 @@ class AtomEncoder2(AbstractFromTorch):
         p = p + self.embed_atompair_mask(v) * v
 
         q = c
+        if self.structure_prediction:
+            # run only in structure model not in initial encoding
+            atom_to_token = feats["atom_to_token"]
+
+            s_to_c = self.s_to_c_trans(s_trunk)
+            s_to_c = atom_to_token @ s_to_c #torch.bmm(atom_to_token, s_to_c)
+            c = c + s_to_c
+
+            atom_to_token_queries = atom_to_token.reshape(
+                B, K, W, atom_to_token.shape[-1]
+            )
+            atom_to_token_keys = to_keys(atom_to_token)
+            z_to_p = self.z_to_p_trans(z)
+            z_to_p = jnp.einsum(
+                "bijd,bwki,bwlj->bwkld",
+                z_to_p,
+                atom_to_token_queries,
+                atom_to_token_keys,
+            )
+            p = p + z_to_p
 
         p = p + self.c_to_p_trans_q(c.reshape(B, K, W, 1, c.shape[-1]))
         p = p + self.c_to_p_trans_k(to_keys(c).reshape(B, K, 1, H, c.shape[-1]))
@@ -2549,7 +2566,7 @@ class PairformerNoSeqModule(eqx.Module):
     stacked_parameters: PairformerNoSeqLayer
     static: PairformerNoSeqLayer
 
-    def __call__(self, z, pair_mask, *, key, deterministic=False):
+    def __call__(self, z, pair_mask, *, key, deterministic):
         @jax.checkpoint
         def body_fn(a, params):
             z, key = a
@@ -2690,7 +2707,7 @@ class MSALayer2(AbstractFromTorch):
     pairformer_layer: PairformerNoSeqLayer
     outer_product_mean: OuterProductMean
 
-    def __call__(self, z, m, token_mask, msa_mask, *, key, deterministic=False):
+    def __call__(self, z, m, token_mask, msa_mask, *, key, deterministic):
         msa_dropout, key = get_dropout_mask(
             self.msa_dropout, m, not deterministic, key=key
         )
@@ -2735,7 +2752,7 @@ class MSAModule2(eqx.Module):
             static,
         )
 
-    def __call__(self, z, emb, feats, *, key, deterministic=False):
+    def __call__(self, z, emb, feats, *, key, deterministic):
         """
         z: Float[Array, "B N N D"]
         emb: Float[Array, "B N P"]
@@ -2851,6 +2868,364 @@ class DistogramModule2(AbstractFromTorch):
         )
        
 
+
+register_from_torch(boltz.model.modules.encodersv2.PairwiseConditioning)(PairwiseConditioning)
+
+
+def stack_modules(ms):
+    static = eqx.filter(ms[0], lambda x: not eqx.is_inexact_array(x))
+    stacked_parameters = tree.map(
+        lambda *v: jnp.stack(v, 0),
+        *[eqx.filter(m, eqx.is_inexact_array) for m in ms],
+    )
+    return eqx.combine(stacked_parameters, static)
+
+
+def eval_stacked_modules(modules, x):
+    params, static = eqx.partition(modules, eqx.is_inexact_array)
+    return vmap(lambda p: eqx.combine(p, static)(x), in_axes=0)(params)
+
+@register_from_torch(boltz.model.modules.diffusion_conditioning.DiffusionConditioning)
+class DiffusionConditioning2(eqx.Module):
+    pairwise_conditioner: PairwiseConditioning
+
+    atom_encoder: AtomEncoder2
+
+    atom_enc_proj_z: eqx.Module
+    atom_dec_proj_z: eqx.Module
+    token_trans_proj_z: eqx.Module
+
+
+
+
+
+    def __call__(self, s_trunk: Float[Array, "B N Ts"], z_trunk: Float[Array, "B N N Tz"], relative_position_encoding: Float[Array, "B N N Tz"], feats: dict[str, any]):
+        """
+        s_trunk: Float[Array, "B N Ts"]
+        z_trunk: Float[Array, "B N N Tz"]
+        relative_position_encoding: Float[Array, "B N N Tz"]
+        feats: dict[str, any]
+        """
+        # Compute pairwise conditioning
+        z = self.pairwise_conditioner(
+            z_trunk,
+            relative_position_encoding,
+        )
+
+        q, c, p, to_keys = self.atom_encoder(
+            feats = feats,
+            s_trunk=s_trunk,
+            z=z,
+        )
+
+        def swap_and_cat(o):
+            return einops.rearrange(o, "D ... P -> ... (D P)")
+
+        atom_enc_bias = swap_and_cat(eval_stacked_modules(self.atom_enc_proj_z, p))
+        atom_dec_bias = swap_and_cat(eval_stacked_modules(self.atom_dec_proj_z, p))
+        token_trans_bias = swap_and_cat(eval_stacked_modules(self.token_trans_proj_z, z))
+
+        return q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias
+
+    @staticmethod
+    def from_torch(m: boltz.model.modules.diffusion_conditioning.DiffusionConditioning):
+        return DiffusionConditioning2(
+            pairwise_conditioner = from_torch(m.pairwise_conditioner),
+            atom_encoder = from_torch(m.atom_encoder),
+            atom_enc_proj_z = stack_modules(from_torch(m.atom_enc_proj_z)),
+            atom_dec_proj_z = stack_modules(from_torch(m.atom_dec_proj_z)),
+            token_trans_proj_z= stack_modules(from_torch(m.token_trans_proj_z))
+        )
+
+
+@register_from_torch(boltz.model.modules.encodersv2.AtomAttentionDecoder)
+class AtomAttentionDecoder2(AbstractFromTorch):
+    a_to_q_trans: Linear
+    atom_decoder: AtomTransformer2
+    atom_feat_to_atom_pos_update: Sequential
+
+    def __call__(
+        self, *, a, q, c, atom_dec_bias, feats, to_keys, multiplicity=1
+    ):
+        assert multiplicity == 1
+        atom_mask = feats["atom_pad_mask"]
+
+        atom_to_token = feats["atom_to_token"]
+        a_to_q = self.a_to_q_trans(a)
+        a_to_q = atom_to_token @ a_to_q#vmap(lambda M, v: M @ v)(atom_to_token, a_to_q)
+        q = q + a_to_q
+        q = self.atom_decoder(
+            q=q,
+            mask=atom_mask,
+            c=c,
+            bias=atom_dec_bias,
+            multiplicity=multiplicity,
+            to_keys=to_keys,
+        )
+        r_update = self.atom_feat_to_atom_pos_update(q)
+        return r_update  
+
+
+register_from_torch(boltz.model.modules.encodersv2.SingleConditioning)(SingleConditioning)            
+
+@register_from_torch(boltz.model.modules.diffusionv2.DiffusionModule)
+class DiffusionModule2(AbstractFromTorch):
+    single_conditioner: SingleConditioning
+    atom_attention_encoder: AtomAttentionEncoder2
+    s_to_a_linear: Sequential
+    token_transformer: DiffusionTransformer2
+    a_norm: LayerNorm
+    atom_attention_decoder: AtomAttentionDecoder2
+
+    def __call__(self, s_inputs: Float[Array, "b n ts"], s_trunk: Float[Array, "b n ts"], r_noisy: Float[Array, "bm m 3"], times: Float[Array, "bm 1 1"], feats, diffusion_conditioning, multiplicity=1, *, key):
+        s, normed_fourier = self.single_conditioner(
+            times, s_trunk, s_inputs
+        )
+        a, q_skip, c_skip, to_keys = self.atom_attention_encoder(
+            feats=feats,
+            q=diffusion_conditioning["q"],
+            c=diffusion_conditioning["c"],
+            atom_enc_bias=diffusion_conditioning["atom_enc_bias"],
+            to_keys=diffusion_conditioning["to_keys"],
+            r=r_noisy,  # Float['b m 3'],
+            multiplicity=multiplicity,
+        )
+         # Full self-attention on token level
+        a = a + self.s_to_a_linear(s)
+
+        mask = feats["token_pad_mask"]
+        a = self.token_transformer(
+            a,
+            mask=mask,
+            s=s,
+            bias=diffusion_conditioning[
+                "token_trans_bias"
+            ],
+            multiplicity=multiplicity,
+        )
+        a = self.a_norm(a)
+        r_update = self.atom_attention_decoder(
+            a=a,
+            q=q_skip,
+            c=c_skip,
+            atom_dec_bias=diffusion_conditioning["atom_dec_bias"],
+            feats=feats,
+            multiplicity=multiplicity,
+            to_keys=to_keys,
+        )
+
+        return r_update
+
+
+def compute_random_augmentation(
+    s_trans=1.0, *, key
+):
+    R = random_rotations(1, key = key)
+    random_trans = (
+        jax.random.normal(shape = (1, 1, 3), key = jax.random.fold_in(key, 1)) * s_trans
+    )
+    return R, random_trans
+
+
+@register_from_torch(boltz.model.modules.diffusionv2.AtomDiffusion)
+class AtomDiffusion2(AbstractFromTorch):
+    score_model: DiffusionModule2
+    sigma_min: float
+    sigma_max: float
+    sigma_data: float
+    rho: float
+    P_mean: float
+    P_std: float
+    gamma_0: float
+    gamma_min: float
+    noise_scale: float
+    step_scale: float
+    step_scale_random: list | None
+    coordinate_augmentation: bool
+    coordinate_augmentation_inference: bool | None
+    alignment_reverse_diff: bool
+    synchronize_sigmas: bool
+
+    def c_skip(self, sigma):
+        return (self.sigma_data**2) / (sigma**2 + self.sigma_data**2)
+
+    def c_out(self, sigma):
+        return sigma * self.sigma_data / jnp.sqrt(self.sigma_data**2 + sigma**2)
+
+    def c_in(self, sigma):
+        return 1 / jnp.sqrt(sigma**2 + self.sigma_data**2)
+
+    def c_noise(self, sigma):
+        return jnp.log(sigma / self.sigma_data) * 0.25
+
+    @eqx.filter_jit
+    def preconditioned_network_forward(
+        self,
+        noised_atom_coords,  #: Float['b m 3'],
+        sigma,  #: Float['b'] | Float[' '] | float,
+        network_condition_kwargs: dict,
+        *,
+        key
+    ):
+        batch = noised_atom_coords.shape[0]
+
+        # if isinstance(sigma, float):
+        sigma = jnp.full((batch,), sigma) 
+
+        padded_sigma = einops.rearrange(sigma, "b -> b 1 1")
+
+        r_update = self.score_model(
+            r_noisy=self.c_in(padded_sigma) * noised_atom_coords,
+            times=self.c_noise(sigma),
+            **network_condition_kwargs,
+            key = key
+        )
+
+        denoised_coords = (
+            self.c_skip(padded_sigma) * noised_atom_coords
+            + self.c_out(padded_sigma) * r_update
+        )
+        return denoised_coords
+
+    def sample_schedule(self, num_sampling_steps):
+        inv_rho = 1 / self.rho
+
+        steps = jnp.arange(
+            num_sampling_steps,  dtype=jnp.float32
+        )
+        sigmas = (
+            self.sigma_max**inv_rho
+            + steps
+            / (num_sampling_steps - 1)
+            * (self.sigma_min**inv_rho - self.sigma_max**inv_rho)
+        ) ** self.rho
+
+        sigmas = sigmas * self.sigma_data
+
+        sigmas = jnp.pad(sigmas, (0, 1))  # last step is sigma value of 0.
+        return sigmas
+    
+    def sample(
+        self,
+        atom_mask,
+        num_sampling_steps,
+        *,
+        key,
+        **network_condition_kwargs,
+       
+    ):
+        multiplicity = 1
+
+        shape = (*atom_mask.shape, 3)
+
+        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
+        sigmas = self.sample_schedule(num_sampling_steps)
+        gammas = jnp.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+        # if self.training and self.step_scale_random is not None:
+        #     step_scale = np.random.choice(self.step_scale_random)
+        # else:
+        step_scale = self.step_scale
+
+        # atom position is noise at the beginning
+        init_sigma = sigmas[0]
+        atom_coords = init_sigma * jax.random.normal(shape = shape, key = key)#torch.randn(shape, device=self.device)
+        key = jax.random.fold_in(key, 1)
+        token_repr = None
+        atom_coords_denoised = None
+
+        # TODO: replace with jax.lax.scan.
+        # gradually denoise
+        for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+            random_R, random_tr = compute_random_augmentation(
+                key = key
+            )
+            key = jax.random.fold_in(key, 1)
+            atom_coords = atom_coords - atom_coords.mean(axis=-2, keepdims=True)
+            atom_coords = (
+                jnp.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+            )
+
+            # this doesn't do anything, right?
+            # if atom_coords_denoised is not None:
+            #     atom_coords_denoised -= atom_coords_denoised.mean(axis=-2, keepdims=True)
+            #     atom_coords_denoised = (
+            #         jnp.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
+            #         + random_tr
+            #     )
+
+
+            # if steering_args["guidance_update"] and scaled_guidance_update is not None:
+            #     scaled_guidance_update = torch.einsum(
+            #         "bmd,bds->bms", scaled_guidance_update, random_R
+            #     )
+            # does .item() detach?
+            # sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+
+            t_hat = sigma_tm * (1 + gamma)
+            # steering_t = 1.0 - (step_idx / num_sampling_steps)
+            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
+            eps = jnp.sqrt(noise_var) * jax.random.normal(shape = shape, key = key)
+            key = jax.random.fold_in(key, 1)
+            atom_coords_noisy = atom_coords + eps
+            atom_coords_denoised = self.preconditioned_network_forward(
+                    atom_coords_noisy,
+                    t_hat,
+                    network_condition_kwargs=dict(
+                        **network_condition_kwargs,
+                    ),
+                    key = key
+                )
+            #atom_coords_denoised = jnp.zeros_like(atom_coords_noisy)
+            # sample_ids = jnp.arange(multiplicity)#.to(atom_coords_noisy.device)
+            # sample_ids_chunks = (sample_ids,)
+
+            # # we don't chunk so... remove this
+            # for sample_ids_chunk in sample_ids_chunks:
+            #     atom_coords_denoised_chunk = self.preconditioned_network_forward(
+            #         atom_coords_noisy[sample_ids_chunk],
+            #         t_hat,
+            #         network_condition_kwargs=dict(
+            #             **network_condition_kwargs,
+            #         ),
+            #         key = key
+            #     )
+            #     key = jax.random.fold_in(key, 1)
+            #     atom_coords_denoised.at[sample_ids_chunk].set(atom_coords_denoised_chunk)
+
+
+            if self.alignment_reverse_diff:
+                # with torch.autocast("cuda", enabled=False):
+                atom_coords_noisy = weighted_rigid_align(
+                    atom_coords_noisy,
+                    atom_coords_denoised,
+                    atom_mask,
+                    atom_mask,
+                )
+
+
+            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
+            atom_coords_next = (
+                atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
+            )
+
+            atom_coords = atom_coords_next
+
+        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+
+    def noise_distribution(self, batch_size, *, key):
+        return (
+            self.sigma_data
+            * jnp.exp(
+                self.P_mean
+                + self.P_std * jax.random.normal(shape = (batch_size,), key = key)
+            )
+        )
+
+
+
+
+
 @register_from_torch(boltz.model.models.boltz2.Boltz2)
 class Joltz2(eqx.Module):
     input_embedder: InputEmbedder2
@@ -2873,6 +3248,9 @@ class Joltz2(eqx.Module):
     template_module: TemplateV2Module
     pairformer_module: Pairformer2
 
+    diffusion_conditioning: DiffusionConditioning2
+    structure_module: AtomDiffusion2
+
     @staticmethod
     def from_torch(m: boltz.model.models.boltz2.Boltz2):
    
@@ -2894,13 +3272,13 @@ class Joltz2(eqx.Module):
             distogram_module=from_torch(m.distogram_module),
             template_module=from_torch(m.template_module),
             msa_module=from_torch(m.msa_module),
-            pairformer_module=from_torch(m.pairformer_module)
-            
-            
+            pairformer_module=from_torch(m.pairformer_module),
+            diffusion_conditioning=from_torch(m.diffusion_conditioning),
+            structure_module=from_torch(m.structure_module)
         )
 
 
-    def __call__(self, feats: dict[str], recycling_steps: int = 0, *, deterministic = False, key):
+    def __call__(self, feats: dict[str], recycling_steps: int = 0, *, num_sampling_steps, deterministic = False, key):
         s_inputs = self.input_embedder(feats)
 
         s_init = self.s_init(s_inputs)
@@ -2957,4 +3335,28 @@ class Joltz2(eqx.Module):
 
         pdistogram = self.distogram_module(z)
         dict_out = {"pdistogram": pdistogram}
+
+        q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = self.diffusion_conditioning(s, z, relative_position_encoding, feats)
+        diffusion_conditioning = {
+            "q": q,
+            "c": c,
+            "to_keys": to_keys,
+            "atom_enc_bias": atom_enc_bias,
+            "atom_dec_bias": atom_dec_bias,
+            "token_trans_bias": token_trans_bias,
+        }
+        # return diffusion_conditioning
+        with jax.default_matmul_precision("float32"):
+            return self.structure_module.sample(
+                s_trunk=s,
+                s_inputs=s_inputs,
+                feats=feats,
+                num_sampling_steps=num_sampling_steps,
+                atom_mask=feats["atom_pad_mask"],
+                multiplicity=1,
+                # steering_args=self.steering_args,
+                diffusion_conditioning=diffusion_conditioning,
+                key = jax.random.fold_in(key, 2),
+            )
+
         return dict_out

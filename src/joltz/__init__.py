@@ -31,6 +31,7 @@ import boltz.model.layers.triangular_attention.primitives
 import boltz.model.layers.triangular_mult
 import boltz.model.models.boltz1
 import boltz.model.modules.confidence
+import boltz.model.modules.confidencev2
 import boltz.model.modules.diffusion
 import boltz.model.modules.diffusion_conditioning
 import boltz.model.modules.diffusionv2
@@ -3114,29 +3115,20 @@ class AtomDiffusion2(AbstractFromTorch):
         **network_condition_kwargs,
        
     ):
-        multiplicity = 1
-
         shape = (*atom_mask.shape, 3)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(num_sampling_steps)
         gammas = jnp.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
-        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
-        # if self.training and self.step_scale_random is not None:
-        #     step_scale = np.random.choice(self.step_scale_random)
-        # else:
+
         step_scale = self.step_scale
 
         # atom position is noise at the beginning
-        init_sigma = sigmas[0]
-        atom_coords = init_sigma * jax.random.normal(shape = shape, key = key)#torch.randn(shape, device=self.device)
-        key = jax.random.fold_in(key, 1)
-        token_repr = None
-        atom_coords_denoised = None
 
-        # TODO: replace with jax.lax.scan.
-        # gradually denoise
-        for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+        @jax.checkpoint
+        def sample_body_function(carry, input):
+            (sigma_tm, sigma_t, gamma) = input
+            atom_coords, key = carry
             random_R, random_tr = compute_random_augmentation(
                 key = key
             )
@@ -3146,24 +3138,7 @@ class AtomDiffusion2(AbstractFromTorch):
                 jnp.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
             )
 
-            # this doesn't do anything, right?
-            # if atom_coords_denoised is not None:
-            #     atom_coords_denoised -= atom_coords_denoised.mean(axis=-2, keepdims=True)
-            #     atom_coords_denoised = (
-            #         jnp.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
-            #         + random_tr
-            #     )
-
-
-            # if steering_args["guidance_update"] and scaled_guidance_update is not None:
-            #     scaled_guidance_update = torch.einsum(
-            #         "bmd,bds->bms", scaled_guidance_update, random_R
-            #     )
-            # does .item() detach?
-            # sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
-
             t_hat = sigma_tm * (1 + gamma)
-            # steering_t = 1.0 - (step_idx / num_sampling_steps)
             noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
             eps = jnp.sqrt(noise_var) * jax.random.normal(shape = shape, key = key)
             key = jax.random.fold_in(key, 1)
@@ -3176,26 +3151,8 @@ class AtomDiffusion2(AbstractFromTorch):
                     ),
                     key = key
                 )
-            #atom_coords_denoised = jnp.zeros_like(atom_coords_noisy)
-            # sample_ids = jnp.arange(multiplicity)#.to(atom_coords_noisy.device)
-            # sample_ids_chunks = (sample_ids,)
-
-            # # we don't chunk so... remove this
-            # for sample_ids_chunk in sample_ids_chunks:
-            #     atom_coords_denoised_chunk = self.preconditioned_network_forward(
-            #         atom_coords_noisy[sample_ids_chunk],
-            #         t_hat,
-            #         network_condition_kwargs=dict(
-            #             **network_condition_kwargs,
-            #         ),
-            #         key = key
-            #     )
-            #     key = jax.random.fold_in(key, 1)
-            #     atom_coords_denoised.at[sample_ids_chunk].set(atom_coords_denoised_chunk)
-
 
             if self.alignment_reverse_diff:
-                # with torch.autocast("cuda", enabled=False):
                 atom_coords_noisy = weighted_rigid_align(
                     atom_coords_noisy,
                     atom_coords_denoised,
@@ -3209,9 +3166,15 @@ class AtomDiffusion2(AbstractFromTorch):
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
-            atom_coords = atom_coords_next
+            return (atom_coords_next, jax.random.fold_in(key, 0)), None
 
-        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        (atom_coords, _), _ = jax.lax.scan(
+            sample_body_function,
+            (sigmas[0] * jax.random.normal(shape = shape, key = key), jax.random.fold_in(key, 1)),
+            (sigmas[:-1], sigmas[1:], gammas[1:])
+        )
+
+        return atom_coords
 
     def noise_distribution(self, batch_size, *, key):
         return (
@@ -3224,7 +3187,274 @@ class AtomDiffusion2(AbstractFromTorch):
 
 
 
+class ConfidenceMetrics(eqx.Module):
+    pde_logits: Float[Array, "b n n 64"]
+    pae_logits: Float[Array, "b n n 64"]
+    plddt_logits: Float[Array, "b n 50"]
+    resolved_logits: Float[Array, "b n 2"]
+    plddt: Float[Array, "b n"]
+    pde: Float[Array, "b n n"]
+    pae: Float[Array, "b n n"]
+    complex_plddt: Float[Array, "b"]
+    complex_iplddt: Float[Array, "b"]
+    complex_pde: Float[Array, "b"]
+    complex_ipde: Float[Array, "b"]
 
+        
+
+
+@register_from_torch(boltz.model.modules.confidencev2.ConfidenceHeads)
+class ConfidenceHeads2(AbstractFromTorch):
+    max_num_atoms_per_token: int
+    token_level_confidence: bool
+    to_pae_intra_logits: Linear
+    to_pae_inter_logits: Linear
+    to_pde_intra_logits: Linear
+    to_pde_inter_logits: Linear
+    to_plddt_logits: Linear
+    to_resolved_logits: Linear
+
+
+
+    # TODO: Rewrite all of this to use boolean manipulation instead of multiplication etc...
+    def __call__(self, s : Float[Array, "b n ts"], z: Float[Array, "b n n tz"], x_pred: Float[Array, "b m 3"], d, feats: dict[str], pred_distogram_logits):
+        asym_id_token = feats["asym_id"]
+        is_same_chain = asym_id_token[..., None] == asym_id_token[..., None, :]
+        is_different_chain = jnp.logical_not(is_same_chain)
+
+        pae_intra_logits = self.to_pae_intra_logits(z)
+        pae_intra_logits = pae_intra_logits * is_same_chain[..., None]
+
+        pae_inter_logits = self.to_pae_inter_logits(z)
+        pae_inter_logits = (
+            pae_inter_logits * is_different_chain[..., None]
+        )
+
+        pae_logits = pae_inter_logits + pae_intra_logits
+
+        pde_intra_logits = self.to_pde_intra_logits(z + einops.rearrange(z,"b n m tz -> b m n tz"))
+        pde_intra_logits = pde_intra_logits * is_same_chain[..., None]
+
+        pde_inter_logits = self.to_pde_inter_logits(z + einops.rearrange(z, "b n m tz -> b m n tz"))
+        pde_inter_logits = pde_inter_logits * is_different_chain[..., None]
+
+        pde_logits = pde_inter_logits + pde_intra_logits
+        resolved_logits = self.to_resolved_logits(s)
+        plddt_logits = self.to_plddt_logits(s)
+        ligand_weight = 20
+        non_interface_weight = 1
+        interface_weight = 10
+
+        token_type = feats["mol_type"]
+        is_ligand_token = token_type == const.chain_type_ids["NONPOLYMER"]
+        plddt = compute_aggregated_metric(plddt_logits)
+
+        token_pad_mask = feats["token_pad_mask"]
+        complex_plddt = (plddt * token_pad_mask).sum(axis=-1) / token_pad_mask.sum(
+            axis=-1
+        )
+
+        is_contact = (d < 8)
+        is_different_chain = (
+            feats["asym_id"][..., None] != feats["asym_id"][..., None, :]
+        )
+        token_interface_mask = jnp.max(
+            is_contact * is_different_chain * (1 - is_ligand_token)[..., None],
+            axis=-1,
+        )
+        token_non_interface_mask = (1 - token_interface_mask) * (
+            1 - is_ligand_token
+        )
+        iplddt_weight = (
+            is_ligand_token * ligand_weight
+            + token_interface_mask * interface_weight
+            + token_non_interface_mask * non_interface_weight
+        )
+        complex_iplddt = (plddt * token_pad_mask * iplddt_weight).sum(
+            axis=-1
+        ) / jnp.sum(token_pad_mask * iplddt_weight, axis=-1)
+
+        # Compute the gPDE and giPDE
+        pde = compute_aggregated_metric(pde_logits, end=32)
+        pred_distogram_prob = jax.nn.softmax(pred_distogram_logits, axis=-1)
+        contacts = jnp.zeros((1, 1, 1, 64), dtype=pred_distogram_prob.dtype)
+        contacts = contacts.at[:, :, :, :20].set(1.0)
+        prob_contact = (pred_distogram_prob * contacts).sum(-1)
+        token_pad_mask = feats["token_pad_mask"]
+        token_pad_pair_mask = (
+            token_pad_mask[..., None]
+            * token_pad_mask[..., None, :]
+            * (
+                1
+                - jnp.eye(
+                    token_pad_mask.shape[1]
+                )[None]
+            )
+        )
+        token_pair_mask = token_pad_pair_mask * prob_contact
+        complex_pde = (pde * token_pair_mask).sum(axis=(1, 2)) / token_pair_mask.sum(
+            axis=(1, 2)
+        )
+        asym_id = feats["asym_id"]
+        token_interface_pair_mask = token_pair_mask * (
+            asym_id[..., None] != asym_id[..., None, :]
+        )
+        complex_ipde = (pde * token_interface_pair_mask).sum(axis=(1, 2)) / (
+            token_interface_pair_mask.sum(axis=(1, 2)) + 1e-5
+        )
+
+        return ConfidenceMetrics(
+            pde_logits=pde_logits,
+            pae_logits=pae_logits,
+            plddt_logits=plddt_logits,
+            resolved_logits=resolved_logits,
+            pde=pde,
+            pae=compute_aggregated_metric(pae_logits, end=32),
+            complex_plddt=complex_plddt,
+            complex_iplddt=complex_iplddt,
+            complex_pde=complex_pde,
+            complex_ipde=complex_ipde,
+            plddt=plddt,
+        )
+
+@register_from_torch(boltz.model.modules.confidencev2.ConfidenceModule)
+class ConfidenceModule2(AbstractFromTorch):
+    confidence_heads: ConfidenceHeads2
+    
+    max_num_atoms_per_token: int
+    boundaries: Float[Array, "num_bins"]
+    dist_bin_pairwise_embed: Embedding
+    token_level_confidence: bool
+
+    s_to_z: Linear
+    s_to_z_transpose: Linear
+
+    add_s_to_z_prod: bool
+    s_to_z_prod_in1: Linear | None
+    s_to_z_prod_in2: Linear | None
+    s_to_z_prod_out: Linear | None
+
+    s_inputs_norm: LayerNorm
+
+    no_update_s: bool
+    s_norm: LayerNorm | None
+    z_norm: LayerNorm
+
+    add_s_input_to_s: bool
+    s_input_to_s: Linear | None
+
+    add_z_input_to_z: bool
+    rel_pos: RelativePositionEncoder2 | None
+    token_bonds: Linear | None
+
+    bond_type_feature: bool
+    token_bonds_type: Embedding | None
+
+    contact_conditioning: ContactConditioning | None
+
+    pairformer_stack: Pairformer2
+    return_latent_feats: bool
+
+    def __call__(self, 
+    s_inputs: Float[Array, "b n ts"],
+    s: Float[Array, "b n ts"],
+    z: Float[Array, "b n n tz"],
+    x_pred: Float[Array, "b m 3"],
+    feats: dict[str, any],
+    pred_distogram_logits: Float[Array, "b n n 64"],
+    *,
+    key,
+    deterministic: bool):
+        s_inputs = self.s_inputs_norm(s_inputs)
+        if not self.no_update_s:
+            s = self.s_norm(s)
+        
+        if self.add_s_input_to_s:
+            s = s + self.s_input_to_s(s_inputs)
+
+        z = self.z_norm(z)
+
+        if self.add_z_input_to_z:
+            relative_position_encoding = self.rel_pos(feats)
+            z = z + relative_position_encoding
+            z = z + self.token_bonds(feats["token_bonds"])
+            if self.bond_type_feature:
+                z = z + self.token_bonds_type(feats["type_bonds"])
+            z = z + self.contact_conditioning(feats)
+        
+        z = (
+            z
+            + self.s_to_z(s_inputs)[:, :, None, :]
+            + self.s_to_z_transpose(s_inputs)[:, None, :, :]
+        )
+        if self.add_s_to_z_prod:
+            z = z + self.s_to_z_prod_out(
+                self.s_to_z_prod_in1(s_inputs)[:, :, None, :]
+                * self.s_to_z_prod_in2(s_inputs)[:, None, :, :]
+            )
+
+        token_to_rep_atom = feats["token_to_rep_atom"]
+        if len(x_pred.shape) == 4:
+            B, mult, N, _ = x_pred.shape
+            x_pred = x_pred.reshape(B * mult, N, -1)
+        else:
+            BM, N, _ = x_pred.shape
+        x_pred_repr = token_to_rep_atom @ x_pred
+
+        def cdist(
+            a: Float[Array, "B N D"], b: Float[Array, "B M D"]
+        ) -> Float[Array, "B N M"]:
+            r = a[:, :, None, :] - b[:, None, :, :]
+            return jnp.sqrt(jnp.sum(r * r, axis=-1) + 1e-8)
+
+        d = cdist(x_pred_repr, x_pred_repr)
+        distogram = (d[..., None] > self.boundaries).sum(axis=-1).astype(jnp.int32)
+        distogram = self.dist_bin_pairwise_embed(distogram)
+        z = z + distogram
+
+        mask = feats["token_pad_mask"]
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+        s_t, z_t = self.pairformer_stack(
+            s,
+            z,
+            mask=mask,
+            pair_mask=pair_mask,
+            key = key,
+            deterministic=deterministic,
+        )
+        s = s_t
+        z = z_t
+
+
+        return self.confidence_heads(
+                s=s,
+                z=z,
+                x_pred=x_pred,
+                d=d,
+                feats=feats,
+                pred_distogram_logits=pred_distogram_logits,
+            )
+
+
+
+
+        
+
+    
+
+
+
+class InitialEmbedding(eqx.Module):
+    s_inputs: Float[Array, "b n d"]
+    s_init: Float[Array, "b n ts"]
+    z_init: Float[Array, "b n n tz"]
+    relative_position_encoding: Float[Array, "b n n tz"]
+
+class TrunkState(eqx.Module):
+    s: Float[Array, "b n ts"]
+    z: Float[Array, "b n n tz"]
+
+    
 
 @register_from_torch(boltz.model.models.boltz2.Boltz2)
 class Joltz2(eqx.Module):
@@ -3250,10 +3480,11 @@ class Joltz2(eqx.Module):
 
     diffusion_conditioning: DiffusionConditioning2
     structure_module: AtomDiffusion2
+    confidence_module: ConfidenceModule2
 
     @staticmethod
     def from_torch(m: boltz.model.models.boltz2.Boltz2):
-   
+        assert m.use_templates
 
         return Joltz2(
             input_embedder=from_torch(m.input_embedder),
@@ -3274,11 +3505,12 @@ class Joltz2(eqx.Module):
             msa_module=from_torch(m.msa_module),
             pairformer_module=from_torch(m.pairformer_module),
             diffusion_conditioning=from_torch(m.diffusion_conditioning),
-            structure_module=from_torch(m.structure_module)
+            structure_module=from_torch(m.structure_module),
+            confidence_module=from_torch(m.confidence_module)
         )
 
-
-    def __call__(self, feats: dict[str], recycling_steps: int = 0, *, num_sampling_steps, deterministic = False, key):
+    @eqx.filter_jit
+    def embed_inputs(self, feats: dict[str, any]):
         s_inputs = self.input_embedder(feats)
 
         s_init = self.s_init(s_inputs)
@@ -3295,68 +3527,113 @@ class Joltz2(eqx.Module):
             z_init = z_init + self.token_bonds_type(feats["type_bonds"].astype(jnp.int32))
         z_init = z_init + self.contact_conditioning(feats) 
 
-        #return (s_init, z_init)
-
-        # Perform rounds of the pairwise stack
-        s = jnp.zeros_like(s_init)
-        z = jnp.zeros_like(z_init)
-
+        return InitialEmbedding(
+            s_inputs=s_inputs,
+            s_init=s_init,
+            z_init=z_init,
+            relative_position_encoding=relative_position_encoding
+        )
+    
+    @eqx.filter_jit
+    def trunk_iteration(self, trunk_state: TrunkState, initial_embedding: InitialEmbedding, feats: dict[str, any], *, key, deterministic: bool):
         # Compute pairwise mask
         mask = feats["token_pad_mask"]
         pair_mask = mask[:, :, None] * mask[:, None, :]
-        for i in range(recycling_steps + 1):
-            key = jax.random.fold_in(key, i)
-            # Apply recycling
-            s = s_init + self.s_recycle(self.s_norm(s))
-            z = z_init + self.z_recycle(self.z_norm(z))
 
-            # Compute pairwise stack
-            # if self.use_templates:
-            
+        # Apply recycling
+        s = initial_embedding.s_init + self.s_recycle(self.s_norm(trunk_state.s))
+        z = initial_embedding.z_init + self.z_recycle(self.z_norm(trunk_state.z))
+        
+        z = z + self.template_module(
+            z, feats, pair_mask, deterministic=deterministic, key=key
+        )
+        
+        z = z + self.msa_module(
+            z, initial_embedding.s_inputs, feats, deterministic=deterministic, key=jax.random.fold_in(key, 0)
+        )
 
-            z = z + self.template_module(
-                z, feats, pair_mask, deterministic=deterministic, key=key
-            )
-            
-            
+        s, z = self.pairformer_module(
+            s,
+            z,
+            mask=mask,
+            pair_mask=pair_mask,
+            deterministic=deterministic,
+            key=jax.random.fold_in(key, 1),
+        )
+        return TrunkState(s=s, z=z), jax.random.fold_in(key, 2)
+    
 
-            z = z + self.msa_module(
-                z, s_inputs, feats, deterministic=deterministic, key=jax.random.fold_in(key, 0)
-            )
+    @eqx.filter_jit
+    def recycle(self, initial_embedding: InitialEmbedding, recycling_steps: int, feats: dict[str, any], *, key, deterministic: bool):
+        trunk_state = TrunkState(
+            s=jnp.zeros_like(initial_embedding.s_init),
+            z=jnp.zeros_like(initial_embedding.z_init)
+        )
 
-            s, z = self.pairformer_module(
-                s,
-                z,
-                mask=mask,
-                pair_mask=pair_mask,
-                deterministic=deterministic,
-                key=jax.random.fold_in(key, 1),
-            )
+        def body_fn(carry, _):
+            trunk_state, key = carry
+            trunk_state, key = self.trunk_iteration(trunk_state, initial_embedding, feats, key=key, deterministic=deterministic)
+            return (trunk_state, key), None
 
-        pdistogram = self.distogram_module(z)
-        dict_out = {"pdistogram": pdistogram}
+        state, k = jax.lax.scan(
+            body_fn,
+            (trunk_state, key),
+            None,
+            length=recycling_steps
+        )[0]
 
-        q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = self.diffusion_conditioning(s, z, relative_position_encoding, feats)
-        diffusion_conditioning = {
-            "q": q,
-            "c": c,
-            "to_keys": to_keys,
-            "atom_enc_bias": atom_enc_bias,
-            "atom_dec_bias": atom_dec_bias,
-            "token_trans_bias": token_trans_bias,
-        }
-        # return diffusion_conditioning
+        state = jax.lax.stop_gradient(state)
+
+        return self.trunk_iteration(
+            trunk_state=state,
+            initial_embedding=initial_embedding,
+            feats=feats,
+            key=k,
+            deterministic=deterministic
+        )
+
+    def __call__(self, feats: dict[str], recycling_steps: int = 0, *, num_sampling_steps, deterministic, key):
+        initial_embedding = self.embed_inputs(feats)
+
+        trunk_state, key = self.recycle(
+            initial_embedding=initial_embedding,
+            recycling_steps=recycling_steps,
+            feats=feats,
+            key=key,
+            deterministic=deterministic
+        )
+
+        pdistogram = self.distogram_module(trunk_state.z)
+        
+        q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = self.diffusion_conditioning(trunk_state.s, trunk_state.z, initial_embedding.relative_position_encoding, feats)
         with jax.default_matmul_precision("float32"):
-            return self.structure_module.sample(
-                s_trunk=s,
-                s_inputs=s_inputs,
+            struct_out = self.structure_module.sample(
+                s_trunk=trunk_state.s,
+                s_inputs=initial_embedding.s_inputs,
                 feats=feats,
                 num_sampling_steps=num_sampling_steps,
                 atom_mask=feats["atom_pad_mask"],
                 multiplicity=1,
-                # steering_args=self.steering_args,
-                diffusion_conditioning=diffusion_conditioning,
+                diffusion_conditioning={
+                    "q": q,
+                    "c": c,
+                    "to_keys": to_keys,
+                    "atom_enc_bias": atom_enc_bias,
+                    "atom_dec_bias": atom_dec_bias,
+                    "token_trans_bias": token_trans_bias,
+                },
                 key = jax.random.fold_in(key, 2),
             )
+        
+        confidence_metrics = self.confidence_module(
+            s_inputs=initial_embedding.s_inputs,
+            s=trunk_state.s,
+            z=trunk_state.z,
+            x_pred=struct_out,
+            feats=feats,
+            pred_distogram_logits=pdistogram[:,:,:,0],
+            key = jax.random.fold_in(key, 5),
+            deterministic=deterministic,
+        )
 
-        return dict_out
+        return (pdistogram, struct_out, confidence_metrics)

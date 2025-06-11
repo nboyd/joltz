@@ -9,7 +9,7 @@ import equinox as eqx
 import jax
 import torch
 from jax import numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 from functools import partial
 import numpy as np
 from jax import tree
@@ -116,6 +116,18 @@ class Linear(eqx.Module):
         return Linear(weight=from_torch(l.weight), bias=from_torch(l.bias))
 
 
+
+@register_from_torch(torch.nn.modules.linear.Identity)
+class Identity(eqx.Module):
+
+    def __call__(self, x: Float[Array, "... In"]) -> Float[Array, "... Out"]:
+        return x
+
+    @staticmethod
+    def from_torch(_: torch.nn.modules.linear.Identity):
+        return Identity()
+
+
 @register_from_torch(torch.nn.LayerNorm)
 class LayerNorm(eqx.Module):
     """LayerNorm that matches pytorch semantics"""
@@ -162,26 +174,16 @@ class Sequential(eqx.Module):
     def from_torch(module: torch.nn.Sequential):
         return Sequential(_modules=from_torch(module._modules))
 
-
 @register_from_torch(torch.nn.modules.sparse.Embedding)
-class SparseEmbedding(eqx.Module):
-    embedding: eqx.nn.Embedding
+class Embedding(eqx.Module):
+    weight: Float[Array, "V D"]
 
-    def __call__(self, indices):
-        ndims = len(indices.shape)
-
-        def apply(index):
-            return self.embedding(index)
-
-        f = apply
-        for _ in range(ndims):
-            f = jax.vmap(f)
-
-        return f(indices)
+    def __call__(self, tokens: Int[Array, "..."]) -> Float[Array, "... D"]:
+        return self.weight[tokens]
 
     @staticmethod
     def from_torch(m: torch.nn.modules.sparse.Embedding):
-        return SparseEmbedding(embedding=eqx.nn.Embedding(weight=from_torch(m.weight)))
+        return Embedding(weight=from_torch(m.weight))
 
 
 # Useful for testing

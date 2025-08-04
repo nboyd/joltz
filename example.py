@@ -20,6 +20,7 @@ from boltz.main import (
     download_boltz1 as download,
 )
 from boltz.model.models.boltz1 import Boltz1
+from boltz.data.types import Manifest
 
 import joltz
 
@@ -77,10 +78,11 @@ manifest = process_inputs(
     msa_server_url="https://api.colabfold.com",
     msa_pairing_strategy="greedy",
 )
+
 # Load processed data
 processed_dir = out_dir / "processed"
 processed = BoltzProcessedInput(
-    manifest=manifest.load(processed_dir / "manifest.json"),
+    manifest=Manifest.load(processed_dir / "manifest.json"),
     targets_dir=processed_dir / "structures",
     msa_dir=processed_dir / "msa",
 )

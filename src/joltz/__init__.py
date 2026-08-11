@@ -22,6 +22,7 @@ from functools import partial
 import sys
 
 import boltz
+import boltz.model.modules.affinity
 import boltz.model.layers.outer_product_mean
 import boltz.model.layers.pair_averaging
 import boltz.model.layers.transition
@@ -3637,3 +3638,154 @@ class Joltz2(eqx.Module):
         )
 
         return (pdistogram, struct_out, confidence_metrics)
+
+
+# ---------------------------------------------------------------------------
+# Boltz-2 affinity module: binding-affinity / P(bind) prediction head.
+# JAX port of boltz.model.modules.affinity (weights live in boltz2_aff.ckpt,
+# separate from the structure checkpoint).  See NOTICE for upstream MIT terms.
+# ---------------------------------------------------------------------------
+
+
+def _affinity_cdist(
+    a: Float[Array, "B N D"], b: Float[Array, "B M D"]
+) -> Float[Array, "B N M"]:
+    r = a[:, :, None, :] - b[:, None, :, :]
+    return jnp.sqrt(jnp.sum(r * r, axis=-1) + 1e-8)
+
+
+@register_from_torch(boltz.model.modules.affinity.AffinityHeadsTransformer)
+class AffinityHeadsTransformer(AbstractFromTorch):
+    affinity_out_mlp: Sequential
+    to_affinity_pred_value: Sequential
+    to_affinity_pred_score: Sequential
+    to_affinity_logits_binary: Linear
+
+    def __call__(
+        self,
+        z: Float[Array, "b n n tz"],
+        feats: dict[str, any],
+        multiplicity: int = 1,
+    ):
+        pad_token_mask = jnp.repeat(feats["token_pad_mask"], multiplicity, axis=0)[
+            ..., None
+        ]
+        rec_mask = (
+            jnp.repeat(
+                (feats["mol_type"] == 0).astype(pad_token_mask.dtype),
+                multiplicity,
+                axis=0,
+            )[..., None]
+            * pad_token_mask
+        )
+        lig_mask = (
+            jnp.repeat(
+                feats["affinity_token_mask"].astype(pad_token_mask.dtype),
+                multiplicity,
+                axis=0,
+            )[..., None]
+            * pad_token_mask
+        )
+
+        cross_pair_mask = (
+            lig_mask[:, :, None] * rec_mask[:, None, :]
+            + rec_mask[:, :, None] * lig_mask[:, None, :]
+            + lig_mask[:, :, None] * lig_mask[:, None, :]
+        ) * (1 - jnp.eye(lig_mask.shape[1])[None, :, :, None])
+
+        g = jnp.sum(z * cross_pair_mask, axis=(1, 2)) / (
+            jnp.sum(cross_pair_mask, axis=(1, 2)) + 1e-7
+        )
+        g = self.affinity_out_mlp(g)
+
+        affinity_pred_value = self.to_affinity_pred_value(g).reshape(-1, 1)
+        affinity_pred_score = self.to_affinity_pred_score(g).reshape(-1, 1)
+        affinity_logits_binary = self.to_affinity_logits_binary(
+            affinity_pred_score
+        ).reshape(-1, 1)
+        return {
+            "affinity_pred_value": affinity_pred_value,
+            "affinity_logits_binary": affinity_logits_binary,
+        }
+
+
+@register_from_torch(boltz.model.modules.affinity.AffinityModule)
+class AffinityModule(AbstractFromTorch):
+    boundaries: Float[Array, "num_bins"]
+    dist_bin_pairwise_embed: Embedding
+    s_to_z_prod_in1: Linear
+    s_to_z_prod_in2: Linear
+    z_norm: LayerNorm
+    z_linear: Linear
+    pairwise_conditioner: PairwiseConditioning
+    pairformer_stack: PairformerNoSeqModule
+    affinity_heads: AffinityHeadsTransformer
+
+    def __call__(
+        self,
+        s_inputs: Float[Array, "b n ts"],
+        z: Float[Array, "b n n tz"],
+        x_pred: Float[Array, "b m 3"],
+        feats: dict[str, any],
+        multiplicity: int = 1,
+        *,
+        key=None,
+        deterministic: bool = True,
+    ):
+        # deterministic=True disables pairformer dropout, so the key is unused;
+        # supply a dummy so the signature stays ergonomic for inference.
+        if key is None:
+            key = jax.random.PRNGKey(0)
+
+        z = self.z_linear(self.z_norm(z))
+        z = jnp.repeat(z, multiplicity, axis=0)
+        z = (
+            z
+            + self.s_to_z_prod_in1(s_inputs)[:, :, None, :]
+            + self.s_to_z_prod_in2(s_inputs)[:, None, :, :]
+        )
+
+        token_to_rep_atom = jnp.repeat(
+            feats["token_to_rep_atom"], multiplicity, axis=0
+        )
+        if len(x_pred.shape) == 4:
+            B, mult, N, _ = x_pred.shape
+            x_pred = x_pred.reshape(B * mult, N, -1)
+        x_pred_repr = token_to_rep_atom.astype(x_pred.dtype) @ x_pred
+        d = _affinity_cdist(x_pred_repr, x_pred_repr)
+
+        distogram = (d[..., None] > self.boundaries).sum(axis=-1).astype(jnp.int32)
+        distogram = self.dist_bin_pairwise_embed(distogram)
+
+        z = z + self.pairwise_conditioner(
+            z_trunk=z, token_rel_pos_feats=distogram
+        )
+
+        pad_token_mask = jnp.repeat(feats["token_pad_mask"], multiplicity, axis=0)
+        rec_mask = (
+            jnp.repeat(
+                (feats["mol_type"] == 0).astype(pad_token_mask.dtype),
+                multiplicity,
+                axis=0,
+            )
+            * pad_token_mask
+        )
+        lig_mask = (
+            jnp.repeat(
+                feats["affinity_token_mask"].astype(pad_token_mask.dtype),
+                multiplicity,
+                axis=0,
+            )
+            * pad_token_mask
+        )
+        cross_pair_mask = (
+            lig_mask[:, :, None] * rec_mask[:, None, :]
+            + rec_mask[:, :, None] * lig_mask[:, None, :]
+            + lig_mask[:, :, None] * lig_mask[:, None, :]
+        )
+
+        z = self.pairformer_stack(
+            z, pair_mask=cross_pair_mask, key=key, deterministic=deterministic
+        )
+
+        return self.affinity_heads(z=z, feats=feats, multiplicity=multiplicity)
